@@ -145,7 +145,8 @@ A worker can execute programs by path and read the operator's home directory.」
 
 本仓库只做下面六件事，不做别的（范围控制见 [30-roadmap.md](30-roadmap.md)）：
 
-1. **执行平面抽象**：把「在哪儿跑」从 DshExecutor 里抽出来，变成可插拔的 Execution Plane。
+1. **执行平面抽象**：把「在哪儿跑」从 DshExecutor 里抽出来。接入点是 dsh 已有的 `ctx.fs` / `ctx.shell` seam，
+   **不是**自造转发层——官方 `dsh-sandbox` 文档明说「容器、microVM 或远程执行器会替换整个 `ctx.shell`/`ctx.fs` 能力」。
 2. **端侧 daemon 协议**：命令下发 / 结果回传 / 离线排队 / 断线重连。
 3. **凭据代理**：Agent 侧只能看到「能力句柄」，看不到凭据本身。
 4. **任务级 Watchdog**：独立的进展判据 + 分级介入策略（观察 / 催办 / 叫停 / 交人）。

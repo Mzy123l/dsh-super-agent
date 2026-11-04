@@ -38,6 +38,7 @@ flowchart TB
     R[Router 常驻 Session]
     E[Engine<br/>Trigger/Thread/Eval/Ticket/Assignment 唯一写者]
     W[任务级 Watchdog]
+    DD[DeviceDirectory<br/>设备登记与调度]
   end
   subgraph MP["记忆平面 Memory Plane"]
     L1[Thread 摘要]
@@ -45,10 +46,17 @@ flowchart TB
     L3[抽取式事实]
   end
   subgraph XP["执行平面 Execution Plane"]
-    S1[本机 Session 执行器]
-    S2[端侧 daemon A]
-    S3[端侧 daemon B]
+    direction LR
+    SEAM["ctx.fs / ctx.shell<br/>（dsh 已有 seam）"]
+    S1[本机实现<br/>fs-local / bash-local]
+    S2[远程实现<br/>fs-remote / shell-remote]
+    D1[端侧 daemon A]
+    D2[端侧 daemon B]
     CL[云沙箱]
+    SEAM --- S1
+    SEAM --- S2
+    S2 --- D1
+    S2 --- D2
   end
   subgraph SP["来源平面 Source Plane"]
     GH[GitHub]
@@ -58,7 +66,8 @@ flowchart TB
   SP -->|Trigger| E
   E --> R
   R -->|accept/attach/stop| E
-  E -->|Assignment| XP
+  E -->|解析设备| DD
+  E -->|启动 Worker Session| XP
   XP -->|Report / 工件| E
   E -->|写入派生记忆| MP
   MP -->|链式召回 / 语义召回| R
@@ -69,7 +78,8 @@ flowchart TB
 四条平面边界对应四条不变量：
 
 - 控制平面**只做决策**，不做执行（对应原型 Router 不配写工具的取向）；
-- 执行平面**只执行**，不持有会话状态（I1 的落实）；
+- 执行平面**只执行**，不持有会话状态（I1 的落实）——它的入口是 dsh 已有的 `ctx.fs` / `ctx.shell` seam，
+  不是一个自造的转发层（见 §3.1.2 的修正说明）；
 - 记忆平面**只派生**，永不作为授权依据（I2 的落实）；
 - 来源平面**只翻译**，不解释领域语义（沿用原型 Source 的定位）。
 
@@ -91,24 +101,74 @@ flowchart TB
 这样 Session Log、压缩、模型调用全在云端，只有 `bash` / `read` / `write` / `edit` / `glob` / `grep` 落到设备上。
 好处是恢复语义与单机一致（Session 本来就持久），而执行环境不搬。
 
-#### 3.1.2 端口设计
+#### 3.1.2 接入点：复用 dsh 已有的能力 seam（不是新造一层）
 
-在原型 `ports.ts` 的 `Executor` 旁边增加一个更细的接口，`DshExecutor` 变成它的一个实现：
+**这是本设计里最重要的一处修正。** 最初的方案是在原型 `ports.ts` 旁新造一个 `ExecutionPlane` 接口。
+查过 dsh 源码后，这条路是错的——dsh 已经把「执行环境」抽象成两个现成的能力 seam，
+官方文档甚至明说了远程执行器该怎么做：
+
+> `dsh-sandbox`：「当进程必须在隔离环境中运行时请另选方案——**容器、microVM 或远程执行器会替换整个 `ctx.shell`/`ctx.fs` 能力**，而不是在这里添加后端。」
+
+两个 seam 的形状（本机 `0.2.1-rc.5` 已安装，可直接依赖）：
+
+| seam | 服务 | 定义 | 抽象基类要求 | 一个上下文里 |
+| --- | --- | --- | --- | --- |
+| 文件 | `ctx.fs` | `dsh-fs` | `class FileSystem extends Service`，`super(ctx, 'fs')`；`resolve` / `stat` / `readText` / `streamText` / `readBytes` / `readByteRange` / `listDir` / `write` / `editText` / `watch`，以及能力事实 `sandboxMode?` 与 `processPathFromHostPath` | **只能一个 provider**，加载第二个会抛（cordis 标准重复服务行为） |
+| 命令 | `ctx.shell` | `dsh-shell` | `class ShellExecutor extends Service`，`super(ctx, 'shell')`；`execute(spec)` 返回 `ShellExecution` 句柄（`result` / `readOutput` / `done`），语义规定：`result` 只在基础设施故障时 reject，非零退出、超时、中止都 resolve 成带 `timedOut`/`aborted` 的结果 | 同上，一个上下文一个执行器 |
+
+于是模块 E 的正确形态是：**实现一个远程 `ctx.fs` provider + 一个远程 `ctx.shell` executor，由 daemon 转发。**
+好处是巨量的既有能力**零改动复用**：
+
+- `dsh-tool-fs`、`dsh-tool-fs-search`、`dsh-tool-bash`、`dsh-tool-pwsh` 不用改；
+- `dsh-fs-observation-policy`（读前写、版本防护）照常生效；
+- `dsh-compaction-tool-result-pruner` 的截断口径照常生效；
+- `[exit code: N]` / `[killed by signal: X]` 的退出状态约定由 `dsh-shell` 拥有，不用自己实现；
+- `ctx.jobs` 的后台作业、超时、取消语义都不变。
+
+**而「哪个 Ticket 用远程执行」不是新端口，是 cordis 的 `isolate`**：
+
+```yaml
+# Worker preset 里：让这个 Session 的 fs/shell 用远程实现
+- id: remote-execution
+  name: '@deepseek-ai/dsh-cordis-plugin-group'   # cordis:group
+  group: true
+  isolate:
+    shell: remote        # GlobalRealm 标签；同一 label 的 entry 共享实现
+    fs: remote
+  config:
+    - id: remote-fs
+      name: 'dsh-super-agent/fs-remote'
+      config: { device: ops-macbook, protocol: 1 }
+    - id: remote-shell
+      name: 'dsh-super-agent/shell-remote'
+      config: { device: ops-macbook, shell: bash, protocol: 1 }
+```
+
+依据 `cordis-plugin-loader/src/config/isolate.ts`：`isolate: { shell: 'remote' }` 会为该 entry 分配一个
+`GlobalRealm('remote')` 的 symbol（`isolate: { shell: true }` 则是 entry 本地的 `LocalRealm`）。
+服务解析走 `entry.ctx[Context.isolate]`，因此**同一个 label 下的 entry 共享同一个实现实例**——
+原型 `cordis.patch.yml` 里 Worker preset 的 `isolate: { shell: true }` 就是这个机制，只是用了 entry 局部标签。
+
+附带结论：**Router 与 Worker 可以在同一个进程里用不同的执行后端**，不需要拆进程。
+
+#### 3.1.3 端口设计（留在领域层的那一半）
+
+`ctx.fs`/`ctx.shell` 接管「怎么执行」，领域层仍要回答「在哪台设备执行」。这一半留在 `Executor` port 旁边，
+但形态比原方案小得多——只做设备登记、调度与绑定，**不做命令转发**（那是 seam 的事）：
 
 ```ts
-/** 执行平面：与原型 Executor 端口同构，但把「在哪跑」显式化。 */
-export interface ExecutionPlane {
-  /** 登记一台可作为执行目标的设备；返回稳定 id。 */
+/** 设备目录与调度：只管「哪台设备」，不管「怎么执行」。 */
+export interface DeviceDirectory {
+  /** 登记一台可作为执行目标的设备；name 稳定且唯一。 */
   register(device: DeviceDescriptor): DeviceId
-  /** 为一台设备选择可用模式；离线设备仍返回绑定，只是当前不可调度。 */
-  bind(device: DeviceId, mode: ExecutionMode): void
-  /** 为一个 Ticket 解析应使用的设备：显式绑定 > 标签匹配 > 默认设备 > 排队。 */
+  /** 设备当前状态；调度只读这个。 */
+  state(device: DeviceId): DeviceState
+  /** 为一个 Ticket 解析应使用的设备：已有绑定 > 标签匹配 > 默认设备 > undefined（排队）。 */
   resolve(ticket: Ticket): DeviceId | undefined
-  /** 以下四个与原型 Executor 端口同形，内部按模式分派。 */
-  prepare(ticket: Ticket, outcome: AssessmentOutcome): Ticket
-  start(assignment: Assignment): void
-  deliver(ticketId: string, inputs: Input[]): void
-  stop(ticketId: string): void
+  /** 记录一次绑定；同一 Ticket 只能绑定到一台设备，除非人显式迁移。 */
+  bind(ticketId: string, device: DeviceId, directory: string): void
+  /** 人显式的迁移；记 `execution.migrated` 事实。 */
+  migrate(ticketId: string, to: DeviceId): void
 }
 
 export interface DeviceDescriptor {
@@ -125,7 +185,7 @@ export interface DeviceDescriptor {
 export type ExecutionMode = 'local-session' | 'remote-tools'
 ```
 
-#### 3.1.3 设备状态机
+#### 3.1.4 设备状态机
 
 ```mermaid
 stateDiagram-v2
@@ -147,45 +207,75 @@ stateDiagram-v2
 4. 只有人显式「迁移到 B 设备」才改绑定，改绑定记一条 `ExecutionMigrated` 事实；
 5. 迁移后新 Assignment 带一条恢复提示，复用原型 restart 的 `RESUMED` 文案。
 
-#### 3.1.4 daemon 协议
+#### 3.1.5 daemon 协议：镜像两个 seam，而不是自造命令集
 
-传输层用 dsh 已依赖的 WebSocket（`dsh-host-webserver` 已支持 upgrade 路由），消息为 JSON-RPC 风格。
-核心是**幂等 + 可重放**：每条请求带 `(ticketId, assignmentId, requestSeq)`，daemon 记录已执行的 `requestSeq`，
-重连后从 `requestSeq+1` 重放。
+因为接入点是 `ctx.fs` / `ctx.shell`，协议应当**逐方法镜像**这两个抽象基类，否则会多出一层翻译。
+传输层用 dsh 已依赖的 WebSocket（`dsh-host-webserver` 支持 upgrade 路由），消息为 JSON-RPC 风格。
+
+**核心不变量：每条请求带 `(device, requestSeq)`，daemon 持久记录已完成的 `requestSeq`，重连后从 `requestSeq+1` 重放。**
+这是「上一条命令是否已经生效」的唯一可靠答案。
 
 ```ts
-// 控制面 → daemon
-type ToDaemon =
-  | { t: 'hello';   device: DeviceId; protocol: 1 }
-  | { t: 'prepare'; ticketId: string; workspaceRoot: string; command: string | null; env: EnvLine[]; timeoutMs: number }
-  | { t: 'exec';    ticketId: string; requestSeq: number; argv: string[]; cwd: string; timeoutMs: number;
-                    capability: CapabilityHandle | null; stdin?: string }
-  | { t: 'fs';      ticketId: string; requestSeq: number; op: 'read' | 'write' | 'edit' | 'glob' | 'grep'; args: unknown }
-  | { t: 'cancel';  ticketId: string; requestSeq: number }
-  | { t: 'probe';   ticketId: string }          // Watchdog 用：不打扰 Worker 的环境探针
-  | { t: 'drain' }                              // 优雅下线
+// 控制面 → daemon：镜像 FileSystem
+type FsCall =
+  | { t: 'fs.resolve';  seq: number; path: string; cwd: string }
+  | { t: 'fs.stat';     seq: number; target: FsTarget }
+  | { t: 'fs.readText'; seq: number; target: FsTarget }
+  | { t: 'fs.readBytes';    seq: number; target: FsTarget; maxBytes: number }
+  | { t: 'fs.readByteRange'; seq: number; target: FsTarget; offset: number; length: number }
+  | { t: 'fs.listDir';  seq: number; target: FsTarget }
+  | { t: 'fs.write';    seq: number; target: FsTarget; text: string; guard?: FsVersion }
+  | { t: 'fs.editText'; seq: number; target: FsTarget; old: string; new: string; guard?: FsVersion }
+
+// 控制面 → daemon：镜像 ShellExecutor
+type ShellCall =
+  | { t: 'shell.execute'; seq: number; spec: ResolvedShellSpec; capability: CapabilityHandle | null }
+  | { t: 'shell.readOutput'; seq: number; processId: string; incremental: boolean }
+  | { t: 'shell.kill';  seq: number; processId: string }
+
+type ToDaemon = FsCall | ShellCall
+  | { t: 'hello';    device: DeviceId; protocol: 1 }
+  | { t: 'prepare';  ticketId: string; workspaceRoot: string; command: string | null; env: EnvLine[]; timeoutMs: number }
+  | { t: 'probe';    ticketId: string }   // Watchdog 用：不打扰 Worker 的环境探针
+  | { t: 'drain' }                        // 优雅下线
 
 // daemon → 控制面
 type FromDaemon =
-  | { t: 'ready';   device: DeviceId; capabilities: string[]; clockSkewMs: number }
-  | { t: 'result';  requestSeq: number; exitCode: number | null; stdout: string; stderr: string; truncated: boolean }
+  | { t: 'ready';    device: DeviceId; capabilities: string[]; clockSkewMs: number }
+  | { t: 'value';    seq: number; value: unknown }                       // FsCall / readOutput 的返回值
+  | { t: 'started';  seq: number; processId: string }                    // shell.execute 句柄发布
+  | { t: 'settled';  seq: number; result: ShellRunResult }               // 进程关闭
   | { t: 'artifact'; ticketId: string; kind: 'file' | 'diff' | 'pr'; ref: string; bytes: number }
   | { t: 'heartbeat'; at: string; load: { running: number; queued: number } }
-  | { t: 'error';   requestSeq?: number; code: DaemonErrorCode; detail: string }
+  | { t: 'error';    seq?: number; code: FsErrorCode | 'DAEMON_*'; detail: string }
 ```
+
+**关键约束（照抄 seam 的契约，不要自创）：**
+
+- `readBytes` 必须带 `maxBytes`，超限以 `FS_TOO_LARGE` 失败而**不是截断**；
+- `fs.resolve` 必须返回稳定 `targetKey`（不同路径到达同一文件得到同一个 key）；
+- 变更操作必须原子，且 `guard` 不匹配时以 `FS_STALE_VERSION` 失败；
+- `shell.execute` 的 `result` **只在基础设施故障时 reject**，非零退出、超时、中止都 resolve；
+- 输出用**增量读取**（`readOutput` 连续读不重复输出），否则后台作业语义会坏。
 
 **离线语义**（长文 §5.2 的例子）：
 
 - 云端 Agent 的**非环境步骤**照常推进（读 PR、写总结、回 IM）；
 - **环境步骤**落到 `WaitingForDevice` 的 Input，入队不丢；
-- 设备上线后 daemon 先发 `hello`，控制面把该设备上排队的 `requestSeq` 按序重放；
+- 设备上线后 daemon 先发 `hello`，控制面把该设备上排队的 `seq` 按序重放；
 - 云端 Agent 在恢复提示里被告知「上次有 N 个步骤在这台设备上未确认，先核对再重复对外动作」——
   这正是长文强调的「上一条命令是否已经生效」。
 
-#### 3.1.5 拒绝项
+**一处 seam 覆盖不到的地方要单独处理**：`read_image` 与 `web_fetch` 不走 `ctx.fs`/`ctx.shell`。
+图片读取需要 daemon 回传二进制并按 `dsh-attachment` 的格式封装；`web_fetch` 默认在控制面执行（网络可达性另说）。
+这是本模块唯一的「缝外」工作，必须在设计时显式列出，不能假装被 seam 吸收了。
+
+#### 3.1.6 拒绝项
 
 | 拒绝 | 理由 |
 | --- | --- |
+| 新造 `ExecutionPlane` 端口去转发命令 | dsh 已有 `ctx.fs`/`ctx.shell` seam；自造一层会丢掉退出状态约定、增量输出、观察策略与沙箱事实 |
+| 在 `dsh-sandbox` 上挂远程后端 | 官方文档明确：远程执行器替换整个 `ctx.shell`/`ctx.fs`，不是加后端 |
 | 把整个 dsh Session 搬到 daemon 上跑 | Session 状态会分裂成两份，违反 I1；且 daemon 要背模型调用与压缩的复杂度 |
 | 用 SSH 代替 daemon 协议 | 无幂等、无工件回传、无离线队列，重连后无法判断命令是否生效 |
 | 自动把离线设备的 Ticket 迁到别的设备 | workspace 与未提交的本地修改不可搬（长文 §5.2 明确反对） |
@@ -456,12 +546,35 @@ stateDiagram-v2
 | 插件 id | 提供 | 对应模块 |
 | --- | --- | --- |
 | `dsh-super-agent` | Engine + Runtime + 面板（沿用原型骨架） | 控制平面 |
-| `dsh-super-agent/execution-plane` | `ExecutionPlane` 端口 + 设备注册 + 调度 | E |
+| `dsh-super-agent/device-directory` | `DeviceDirectory` 端口 + 设备注册 + 调度 | E |
+| `dsh-super-agent/fs-remote` | `ctx.fs` 的远程实现（实现 `FileSystem` 抽象基类） | E |
+| `dsh-super-agent/shell-remote` | `ctx.shell` 的远程实现（实现 `ShellExecutor` 抽象基类） | E |
 | `dsh-super-agent/daemon-protocol` | WebSocket 路由 + 幂等重放 | E |
 | `dsh-super-agent/credential-broker` | 句柄、租约、脱敏 | C |
 | `dsh-super-agent/watchdog` | 信号采集 + 分级介入（独立 Session） | W |
 | `dsh-super-agent/speculation` | 预算、隔离区、提升 | P |
 | `dsh-super-agent/memory` | L1/L2/L3 + 遗忘 | M |
+
+其中 `fs-remote` / `shell-remote` 是对 dsh 抽象基类的**实现**，不是新服务：
+
+```ts
+// 远程文件系统：实现 dsh-fs 的抽象基类，注册为 ctx.fs
+export default class RemoteFileSystem extends FileSystem {
+  constructor(ctx: Context, config: RemoteFsConfig) { super(ctx) }  // super(ctx, 'fs')
+  resolve(path: string, opts: { cwd: string }): Promise<FsTarget> { /* → fs.resolve */ }
+  readText(target: FsTarget): Promise<string> { /* → fs.readText */ }
+  // …其余同形
+}
+
+// 远程命令执行器：实现 dsh-shell 的抽象基类，注册为 ctx.shell
+export default class RemoteShellExecutor extends ShellExecutor {
+  constructor(ctx: Context, config: RemoteShellConfig) { super(ctx) }  // super(ctx, 'shell')
+  async execute(spec: ResolvedShellSpec): Promise<ShellExecution> { /* → shell.execute + 增量 readOutput */ }
+  get sandboxMode() { return this.config.sandboxMode }  // 能力事实要如实报告
+}
+```
+
+`dsh-tool-fs` / `dsh-tool-bash` / `dsh-tool-fs-search` **一行都不用改**——这正是选这个接入点的原因。
 
 ### 4.2 用到的 dsh 能力接缝
 
@@ -470,6 +583,9 @@ stateDiagram-v2
 | 需要 | dsh 已提供 | 备注 |
 | --- | --- | --- |
 | 创建/恢复 Session、投递消息 | `dsh-agent` 的 `Agent.followup()` / `steer()` / `inject()` / `whenIdle()` | `inject` 不唤醒，正好用于 notice |
+| **远程文件读写** | `ctx.fs`（`dsh-fs` 的 `FileSystem` 抽象基类） | **模块 E 的主接入点**；一个上下文只能一个 provider |
+| **远程命令执行** | `ctx.shell`（`dsh-shell` 的 `ShellExecutor` 抽象基类） | **模块 E 的主接入点**；拥有退出状态约定 |
+| **按角色隔离执行后端** | cordis entry 的 `isolate: { shell: <label>, fs: <label> }` | `true` = entry 本地 realm；字符串 = 同 label 共享的 `GlobalRealm` |
 | 旁路拦截工具调用 | `ctx.tools.guard()`（单调拒绝）、`tools/pre-execute` waterfall | 用于凭据与危险命令拦截 |
 | 工具结果后处理 | `tools/post-execute` | 用于脱敏过滤 |
 | 后台作业 | `ctx.jobs`（`dsh-jobs`） | 原型已用于 Worker 的后台 shell |
@@ -477,6 +593,7 @@ stateDiagram-v2
 | 工具集差异化 | `@deepseek-ai/dsh-agent-preset` | 原型已用两个 preset 实现 Router/Worker 差异 |
 | 定时驱动 | `dsh-schedule` | Watchdog 与每小时体检 |
 | HTTP/WS 路由 | `dsh-host-webserver` | 管理 API 与 daemon 握手 |
+| 沙箱（不可用时故障关闭） | `ctx.sandbox`（`dsh-sandbox` + `sandbox-local`） | 远程执行器**不需要**它；本地后端仍用它 |
 | MCP | `dsh-mcp-client` | **本设计默认不用**，见 §6 |
 
 ### 4.3 事件契约增量
@@ -498,12 +615,12 @@ memory.forgotten
 
 | 表 | 聚合 | 关键列 | 写者 |
 | --- | --- | --- | --- |
-| `device` | 执行目标 | `name`（唯一）、`mode`、`labels`(json)、`workspace_root`、`credential_profile`、`state`（生成列：`online`） | ExecutionPlane |
-| `workspace_binding` | Ticket ↔ 设备 ↔ 目录 | `ticket_id`、`device_id`、`directory`、`created_at`、`closed_at` | ExecutionPlane |
-| `daemon_request` | 幂等重放 | `(ticket_id, assignment_id, request_seq)` 唯一、`kind`、`result`、`at` | DaemonProtocol |
+| `device` | 执行目标 | `name`（唯一）、`mode`、`labels`(json)、`workspace_root`、`credential_profile`、`state`（生成列：`online`） | DeviceDirectory |
+| `workspace_binding` | Ticket ↔ 设备 ↔ 目录 | `ticket_id`、`device_id`、`directory`、`created_at`、`closed_at` | DeviceDirectory |
+| `daemon_request` | 幂等重放 | `(device_id, request_seq)` 唯一、`kind`、`result`、`at` | DaemonProtocol |
 | `secret_lease` | 凭据租约审计 | `handle_id`、`command`、`canary`、`issued_at`、`expires_at` | CredentialBroker |
 | `speculation` | 投机 | `rule_id`、`trigger_ids`、`budget`(json)、`state`、`adopted_by` | Speculation |
-| `artifact` | 产物引用 | `ticket_id`、`speculation_id`、`kind`、`ref`、`sha256`、`bytes` | ExecutionPlane |
+| `artifact` | 产物引用 | `ticket_id`、`speculation_id`、`kind`、`ref`、`sha256`、`bytes` | DeviceDirectory |
 | `watchdog_observation` | 观察记录 | `ticket_id`、`signal`、`value`、`at`、`intervened` | Watchdog |
 | `memory_entry` | L1/L2/L3 | `tier`、`subject`、`text`、`derived_from`(json)、`confidence`、`expires_at` | Memory |
 
@@ -518,12 +635,23 @@ memory.forgotten
 | 原型路径 | 处理 | 说明 |
 | --- | --- | --- |
 | `src/core/**` | **原样复用** | 不做 I/O、只依赖 port，换适配器即可 |
-| `src/core/ports.ts` | 增补 | 加 `ExecutionPlane`、`Memory`、`WatchdogSink` 三个 port |
-| `src/executor/dsh.ts` | 拆分 | 目录/垫片逻辑下沉到 `execution-plane/local.ts`；`WorkerSlots` 复用 |
+| `src/core/ports.ts` | 增补 | 加 `DeviceDirectory`、`Memory`、`WatchdogSink` 三个 port（**不加执行转发端口**，那由 `ctx.fs`/`ctx.shell` 承担） |
+| `src/executor/dsh.ts` | 拆分 | 目录/垫片逻辑下沉；`WorkerSlots` 直接复用；Session 创建逻辑不变 |
 | `src/app/store.ts` | 换实现 | SQLite 保留，但增加「可切换后端」的 Repository 接口 |
 | `src/sources/github.ts` | 小改 | 从单仓库改多仓库 |
 | `src/app/sessions.ts` | 小改 | `noWait` 守卫、preset 选择逻辑直接复用 |
+| `cordis.patch.yml` | 小改 | Worker preset 的 `isolate` 从 `shell: true` 增加 `fs: true`，并在远程档位换成 `fs: remote, shell: remote` |
 | `scripts/dsh-superagent` | 复用 + 扩展 | 增加 `devices`、`speculations` 子命令 |
+
+**新增但不由原型派生的文件**（模块 E 的净增量）：
+
+| 路径 | 职责 |
+| --- | --- |
+| `src/execution/fs-remote.ts` | 实现 `FileSystem` 抽象基类，转发到 daemon |
+| `src/execution/shell-remote.ts` | 实现 `ShellExecutor` 抽象基类，转发到 daemon |
+| `src/execution/daemon.ts` | WebSocket 服务端：握手、幂等表、重放、心跳 |
+| `src/execution/directory.ts` | `DeviceDirectory` 实现与调度规则 |
+| `packages/daemon/` | 端侧 daemon（独立可执行，零 dsh 依赖） |
 
 ## 5. 端到端时序（新流程）
 
@@ -533,7 +661,8 @@ sequenceDiagram
   participant G as GitHub
   participant E as Engine
   participant R as Router
-  participant P as ExecutionPlane
+  participant T as worker Session<br/>（ctx.fs / ctx.shell = 远程）
+  participant DD as DeviceDirectory
   participant D as Daemon
   participant B as Broker
   participant W as Watchdog
@@ -541,26 +670,31 @@ sequenceDiagram
   G->>E: Trigger（PR 评论）
   E->>R: 候选卡片（explicit）
   R->>E: accept（Mandate 记录 Policy 版本）
-  E->>P: Assignment（ticket, device=ops-macbook）
-  P->>D: prepare（worktree）
-  D-->>P: ready
-  P->>D: exec（gh pr view --json …，capability=gh:repo#read）
+  E->>DD: 解析设备（ops-macbook）
+  DD-->>E: deviceId
+  E->>T: 启动 worker Session（isolate: fs/shell = remote）
+  T->>D: fs.resolve + shell.execute（gh pr view --json …，capability=gh:repo#read）
   D->>B: 兑换租约（60s，金丝雀）
   B-->>D: 短时值
-  D-->>P: 结果（已脱敏）
-  P-->>E: artifact + report(progress)
+  D-->>T: 已脱敏结果（增量 readOutput）
+  T->>E: report(progress) + artifact
   E->>W: 派发进展信号
   W->>W: 规则判定（无命中，静默）
-  D-->>P: artifact(diff)
-  P-->>E: report(ready)
+  T->>D: fs.write（补丁）
+  T->>E: report(ready)
   E->>R: 结果接力
   R->>G: 在原始 PR 下回复
 ```
+
+注意时序里**没有「执行平面」这个参与者**：worker Session 直接对着 `ctx.fs` / `ctx.shell` 说话，
+这两个服务背后是 daemon。领域层只出现在「解析设备」那一步。
 
 ## 6. 拒绝项（本设计明确不做）
 
 | 拒绝 | 理由 |
 | --- | --- |
+| 新造一层执行转发端口，绕过 `ctx.fs`/`ctx.shell` | 会丢掉退出状态约定、增量输出、观察策略、沙箱事实；且工具插件要跟着改 |
+| 在 `dsh-sandbox` 上挂远程后端 | 官方文档明确：远程执行器替换整个 `ctx.shell`/`ctx.fs`，不是加后端 |
 | 引入 MCP 作为新的工具/Source 来源 | 会显著扩大不可信输入的表面；原型的 Source 协议 + `ctx.tools.guard` 已够用。若要接，必须在能力句柄体系内接 |
 | 让 Watchdog 自带完整工具并在线改提示词 | 长文自己点名的故障点；降级为「提案 + 人审」 |
 | 让投机执行直接对外发消息/开 PR | 违反 I2；投机产物必须在隔离区 |
@@ -574,8 +708,11 @@ sequenceDiagram
 | 风险 | 影响 | 缓解 |
 | --- | --- | --- |
 | dsh 仍是 `rc` 且明言破坏兼容 | 依赖随时可能断 | 锁定版本；只用 `ctx.*` 公开接缝；升级前跑全量测试 |
+| `ctx.fs` / `ctx.shell` 的抽象基类在 rc 阶段改签名 | 远程实现要跟着改 | 把 seam 适配隔离在 `src/execution/` 两个文件里；用官方的契约测试口径写自己的测试 |
+| `isolate` 的 realm 语义在升级中变化 | Router/Worker 用错后端 | M1 就写一个「同一进程两种后端」的测试，作为升级回归的哨兵 |
 | daemon 协议成为新的单点 | 一台设备挂了拖住多个 Ticket | 设备级隔离（`degraded` 不接新活）+ 队列重试 |
 | Watchdog 误报赶走用户信任 | 比不做更糟 | 打扰预算 + 精确率自动降级 |
 | 投机执行烧 token | 成本失控 | 三重预算硬停 + 面板可见 |
 | 记忆漂移/污染 | 错误结论被当成事实 | 只派生 + `derivedFrom` 可追溯 + TTL + 人确认 |
 | 多仓库让 Mandate 范围变模糊 | 越权 | Mandate 增加 `repository` 维度；范围不清时拒绝 |
+| `read_image` / `web_fetch` 不在两个 seam 覆盖内 | 远程档位下这两条能力不完整 | 显式列为已知缺口；`read_image` 走 daemon 回传二进制 + `dsh-attachment` 封装，`web_fetch` 默认在控制面执行 |

@@ -9,12 +9,12 @@
 
 1. **先修安全，再修能力。** 凭据代理与执行平面是「能不能扩大范围」的前置条件；投机执行与长程记忆是「范围扩大后才有价值」的东西。
 2. **先可观测，再自动化。** 每个模块的第一个版本都只观察不介入（沿用官方 `observe` 默认档的取向）。
-3. **先单机，再跨设备。** 执行平面抽象先在单机把边界抽干净，再引入 daemon。否则会一边迁移一边改协议。
+3. **先单机，再跨设备。** 执行平面抽象先在单机把 seam 边界摸清（先用 stub 证明 `isolate` 可用），再引入 daemon。否则会一边迁移一边改协议。
 
 ```mermaid
 flowchart LR
-  M0[M0 复用骨架] --> M1[M1 执行平面抽象]
-  M1 --> M2[M2 端侧 daemon + 凭据代理]
+  M0[M0 复用骨架] --> M1[M1 设备调度 + isolate 验证]
+  M1 --> M2[M2 远程 fs/shell + 凭据代理]
   M1 --> M3[M3 任务级 Watchdog]
   M2 --> M4[M4 投机执行 + 记忆分层]
   M3 --> M4
@@ -40,14 +40,16 @@ M2 与 M3 可以并行——它们只共享 Engine 的 port，不互相阻塞。
 
 ---
 
-## M1：执行平面抽象（2 周）
+## M1：设备调度 + `isolate` 验证（2 周）
 
-**目标**：把「在哪儿跑」从 Executor 里抽出来，单机仍然只有一个实现，但边界干净。
+**目标**：把「在哪儿跑」抽出来，单机仍然只有一个实现，但边界干净。
+接入点是 dsh 已有的 `ctx.fs` / `ctx.shell` seam，不是自造转发层（理由见设计文档 §3.1.2）。
 
 **交付**
 
-- `ExecutionPlane` 端口与 `DeviceDescriptor` / `ExecutionMode` 类型；
-- `local-session` 模式的实现（从原型 `DshExecutor` 里把目录与垫片逻辑搬出来）；
+- `DeviceDirectory` 端口与 `DeviceDescriptor` / `DeviceState` / `ExecutionMode` 类型；
+- `local-session` 档位：本机 `ctx.fs` / `ctx.shell` 保持现状，只把目录与垫片逻辑从 `DshExecutor` 抽出；
+- `isolate` 验证：同一进程里 Router 与 Worker 使用不同 `fs`/`shell` 实现的能力证明（用两个 stub 实现即可）；
 - 设备状态机（`registered → online → degraded → offline → draining`）；
 - `workspace_binding` 表与「同一 Ticket 不换设备」的不变式；
 - `device.*` 与 `execution.migrated` 领域事件。
@@ -56,10 +58,11 @@ M2 与 M3 可以并行——它们只共享 Engine 的 port，不互相阻塞。
 
 | # | 标准 | 验证方式 |
 | --- | --- | --- |
-| 1 | 删除执行平面实现后，`src/core` 无需任何改动即可编译 | 编译期检查（core 不 import app） |
-| 2 | 设备 `degraded` 时，进行中的 turn 不被打断，但新 launch 排队 | `runtime-concurrency` 风格的测试 |
-| 3 | 设备 `offline` 时 Ticket 显示 `Working / queued`，不报错、不换设备 | 状态机测试 |
-| 4 | 人为迁移设备后，新 Assignment 带恢复提示，且旧目录不被删除 | 端到端 |
+| 1 | 删除设备调度实现后，`src/core` 无需任何改动即可编译 | 编译期检查（core 不 import app） |
+| 2 | 同一进程里 Router 用本机 `ctx.shell`、Worker 用 stub 远程 `ctx.shell`，互不影响 | 集成测试（cordis `isolate` 语义） |
+| 3 | 设备 `degraded` 时，进行中的 turn 不被打断，但新 launch 排队 | `runtime-concurrency` 风格的测试 |
+| 4 | 设备 `offline` 时 Ticket 显示 `Working / queued`，不报错、不换设备 | 状态机测试 |
+| 5 | 人为迁移设备后，新 Assignment 带恢复提示，且旧目录不被删除 | 端到端 |
 
 **度量**：设备不可用期间，Ticket 的 `queued` 时长 P95 < 人工介入阈值（可配置，默认 30 分钟）。
 
@@ -71,19 +74,24 @@ M2 与 M3 可以并行——它们只共享 Engine 的 port，不互相阻塞。
 
 这是最长的一个里程碑，建议拆成三个可独立上线的子阶段。
 
-### M2a：daemon 协议与幂等重放（3 周）
+### M2a：远程 `ctx.fs` / `ctx.shell` 实现与幂等重放（3 周）
 
-**交付**：`hello` / `prepare` / `exec` / `fs` / `cancel` / `probe` / `drain` 七类消息；
-`daemon_request` 幂等表；断线重连后按 `requestSeq` 重放；`artifact` 回传。
+**交付**：`FileSystem` 与 `ShellExecutor` 两个抽象基类的远程实现；
+`fs.*` / `shell.*` 逐方法镜像的消息集；`daemon_request` 幂等表；断线重连后按 `requestSeq` 重放；
+`artifact` 回传；`read_image` 的二进制回传路径。
 
 **验收**
 
 | # | 标准 |
 | --- | --- |
-| 1 | daemon 断线 30 秒后重连，未确认的命令恰好执行一次（注入计数器验证） |
-| 2 | 同一 `(ticket, assignment, requestSeq)` 重复投递不产生第二次副作用 |
-| 3 | daemon 崩溃后重启，控制面能判断「哪些命令已生效」，并在恢复提示里告知 Worker |
-| 4 | 长时间输出（> 1 MB）被截断且保留头尾，与原型 `tool-result-pruner` 的 8192/4096/1024 口径一致 |
+| 1 | 远程档位下 `dsh-tool-fs` / `dsh-tool-bash` / `dsh-tool-fs-search` **源码零改动**即可工作 |
+| 2 | `readBytes` 超 `maxBytes` 以 `FS_TOO_LARGE` 失败而不是截断 |
+| 3 | `fs.resolve` 对不同路径到达同一文件返回相同 `targetKey`；`write` 的 `guard` 不匹配返回 `FS_STALE_VERSION` |
+| 4 | `shell.execute` 的非零退出、超时、中止都 resolve 成带 `timedOut`/`aborted` 的结果，只有基础设施故障 reject |
+| 5 | 输出增量读取：连续两次 `readOutput` 不重复输出（后台作业语义的前提） |
+| 6 | daemon 断线 30 秒后重连，未确认的命令恰好执行一次（注入计数器验证） |
+| 7 | daemon 崩溃重启后，控制面能判断「哪些命令已生效」，并在恢复提示里告知 Worker |
+| 8 | 长时间输出经 `tool-result-pruner` 的 8192/4096/1024 口径裁剪，行为与本机档位一致 |
 
 ### M2b：设备调度与离线语义（1.5 周）
 
