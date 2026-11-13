@@ -244,7 +244,7 @@
 │ ┌─ tool_result（裁剪）──────────────────────────────────────┐  │
 │ │ <前 4096 字符>                                            │  │
 │ │                                                           │  │
-│ │ [pruned: 12,847 chars omitted (1,166,597 → 5,159, -99.6%) │  │
+│ │ [pruned: 12,847 chars omitted (18,006 → 5,159, -71.3%)   │  │
 │ │  · full result spilled to:                                │  │
 │ │    /…/session-9ecf…/…-tool-result-7731.txt                │  │
 │ │  · recover: read(path, offset=4096)                       │  │
@@ -328,7 +328,7 @@
 | --- | --- | --- |
 | 标记 | `[... tool result middle pruned ...]` | `[pruned: 12,847 chars omitted …]` |
 | 丢了多少 | ❌ | ✅ 12,847 字符 |
-| 压缩比 | ❌ | ✅ -99.6% |
+| 压缩比 | ❌ | ✅ -71.3% |
 | 原件位置 | ❌ | ✅ spill 文件路径 |
 | 怎么取 | ❌ | ✅ `read(path, offset=4096)` |
 

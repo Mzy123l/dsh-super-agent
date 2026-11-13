@@ -1,0 +1,1465 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>上下文对比：修改前 vs 修改后 — 一次真实请求里模型收到什么</title>
+<!--
+  自包含可视化交付物：无 CDN、无外链字体、无网络请求。
+  蓝本：docs/9F-full-context-comparison.md
+  数字：docs/98-compaction-findings.md（实测）
+  标记格式与注入点：docs/9B-dsh-source-findings.md（源码常量）
+  细节对照：docs/9E-example-before-after.md
+-->
+<style>
+  :root{
+    color-scheme: dark;
+    --bg:#0b0f15;
+    --bg-2:#0e141d;
+    --panel:#121a24;
+    --panel-2:#152029;
+    --code-bg:#080c11;
+    --line:#1f2a38;
+    --line-soft:#18212c;
+    --line-strong:#2c3c50;
+    --txt:#dfe7f1;
+    --txt-2:#bcc9d8;
+    --dim:#9aa8ba;
+    --faint:#7f8da0;
+    --blue:#6ea8fe;
+    --green:#4ac26b;
+    --green-bg:rgba(74,194,107,.10);
+    --green-bg-2:rgba(74,194,107,.17);
+    --green-line:rgba(74,194,107,.42);
+    --red:#f0797c;
+    --red-bg:rgba(240,121,124,.07);
+    --red-line:rgba(240,121,124,.36);
+    --amber:#e2b441;
+    --amber-bg:rgba(226,180,65,.10);
+    --strong:#ffffff;
+    --mono:"Cascadia Code",Consolas,"SF Mono",monospace;
+    --sans:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    --radius:10px;
+    --pane-h:74vh;
+  }
+  html[data-theme="light"]{
+    color-scheme: light;
+    --bg:#f6f7f9;
+    --bg-2:#eef1f5;
+    --panel:#ffffff;
+    --panel-2:#f3f5f9;
+    --code-bg:#f7f9fc;
+    --line:#d9e0e9;
+    --line-soft:#e6ebf2;
+    --line-strong:#c2ccda;
+    --txt:#1b2430;
+    --txt-2:#394552;
+    --dim:#4e5c6e;
+    --faint:#68768a;
+    --blue:#1a63d8;
+    --green:#157f3c;
+    --green-bg:rgba(21,127,60,.075);
+    --green-bg-2:rgba(21,127,60,.14);
+    --green-line:rgba(21,127,60,.38);
+    --red:#b02a26;
+    --red-bg:rgba(176,42,38,.055);
+    --red-line:rgba(176,42,38,.32);
+    --amber:#8a6100;
+    --amber-bg:rgba(138,97,0,.09);
+    --strong:#0d1520;
+  }
+
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:
+      radial-gradient(1200px 600px at 15% -10%, rgba(110,168,254,.07), transparent 60%),
+      radial-gradient(900px 500px at 95% 0%, rgba(74,194,107,.05), transparent 60%),
+      var(--bg);
+    color:var(--txt);
+    font-family:var(--sans);
+    font-size:15px;
+    line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+    text-rendering:optimizeLegibility;
+  }
+  code{font-family:var(--mono);font-size:.86em;background:var(--code-bg);border:1px solid var(--line-soft);border-radius:4px;padding:.05em .32em;color:var(--txt-2)}
+  b,strong{color:var(--strong);font-weight:600}
+
+  /* ── 顶部标题区 ─────────────────────────────── */
+  .page-head{padding:34px 40px 20px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,var(--bg-2),transparent)}
+  .eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin-bottom:10px}
+  .page-head h1{margin:0 0 10px;font-size:27px;line-height:1.32;letter-spacing:-.01em;font-weight:650}
+  .page-head .lede{margin:0;color:var(--txt-2);max-width:76ch;font-size:14.5px}
+  .page-head .lede em{color:var(--green);font-style:normal;font-weight:600}
+  .src-line{margin-top:14px;font-size:12px;color:var(--faint);font-family:var(--mono);display:flex;flex-wrap:wrap;gap:6px 18px}
+  .src-line a{color:var(--dim);text-decoration:none;border-bottom:1px dotted var(--line-strong)}
+  .src-line a:hover{color:var(--blue)}
+
+  /* ── 工具条 ─────────────────────────────────── */
+  .toolbar{
+    position:sticky;top:0;z-index:40;
+    display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+    padding:9px 40px;
+    background:rgba(11,15,21,.94);
+    backdrop-filter:blur(8px);
+    border-bottom:1px solid var(--line);
+  }
+  html[data-theme="light"] .toolbar{background:rgba(246,247,249,.94);}
+  .switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer;user-select:none;font-size:13px;color:var(--txt-2)}
+  .switch input{position:absolute;opacity:0;width:1px;height:1px}
+  .switch .track{
+    position:relative;width:34px;height:18px;border-radius:999px;
+    background:var(--panel-2);border:1px solid var(--line-strong);transition:.16s ease;flex:none;
+  }
+  .switch .track::after{
+    content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;
+    background:var(--dim);transition:.16s ease;
+  }
+  .switch input:checked + .track{background:var(--green-bg-2);border-color:var(--green-line)}
+  .switch input:checked + .track::after{left:17px;background:var(--green)}
+  .switch input:focus-visible + .track{outline:2px solid var(--blue);outline-offset:2px}
+  .switch .txt{white-space:nowrap}
+  .toolbar .btn{
+    font-family:var(--sans);font-size:12.5px;color:var(--txt-2);background:var(--panel);
+    border:1px solid var(--line-strong);border-radius:7px;padding:4px 11px;cursor:pointer;transition:.14s;
+  }
+  .toolbar .btn:hover{color:var(--txt);border-color:var(--blue)}
+  .toolbar .hint{font-size:12px;color:var(--faint);margin-left:auto}
+
+  /* ── 横跨两栏的区块 ──────────────────────────── */
+  .span{padding:26px 40px}
+  .span-title{
+    display:flex;align-items:center;gap:10px;
+    margin:0 0 16px;font-size:15px;font-weight:650;letter-spacing:.01em;color:var(--txt);
+  }
+  .span-title .bar{width:3px;height:16px;border-radius:2px;background:var(--blue);flex:none}
+  .span-title .t-sub{font-weight:400;font-size:12.5px;color:var(--faint);font-family:var(--mono)}
+
+  .scn-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+  .scn-card{
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:13px 15px;min-width:0;
+  }
+  .scn-card h3{margin:0 0 7px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);font-weight:600}
+  .scn-card p{margin:0;font-size:13.5px;color:var(--txt-2)}
+  .scn-card .muted{color:var(--faint);font-size:12.5px;margin-top:7px}
+  .quote-list{margin:0;padding:0;list-style:none}
+  .quote-list li{
+    font-size:13.5px;color:var(--txt);padding:3px 0 3px 11px;position:relative;
+  }
+  .quote-list li::before{content:"";position:absolute;left:0;top:.7em;width:4px;height:4px;border-radius:1px;background:var(--red)}
+  .scn-card--warn{border-color:var(--red-line);background:linear-gradient(180deg,var(--red-bg),transparent 70%)}
+  .scn-card--ask{border-color:var(--green-line);background:linear-gradient(180deg,var(--green-bg),transparent 70%)}
+  .ask{
+    font-size:15px;color:var(--strong);font-weight:600;margin:2px 0 0;
+    font-family:var(--mono);letter-spacing:.01em;
+  }
+  .flow{margin:0;padding-left:17px;font-size:13px;color:var(--txt-2)}
+  .flow li{margin:2px 0}
+
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+  .chip{
+    display:inline-flex;align-items:baseline;gap:6px;
+    font-size:12px;padding:3px 10px;border-radius:999px;
+    background:var(--panel-2);border:1px solid var(--line);color:var(--dim);font-family:var(--mono);
+  }
+  .chip b{color:var(--txt);font-family:var(--sans);font-size:12.5px}
+  .chip--g{border-color:var(--green-line);background:var(--green-bg)}
+  .chip--g b{color:var(--green)}
+  .chip--a{border-color:rgba(226,180,65,.34);background:var(--amber-bg)}
+  .chip--a b{color:var(--amber)}
+
+  /* ── 双栏对比区 ─────────────────────────────── */
+  .compare{
+    display:grid;grid-template-columns:1fr 1fr;
+    border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+    background:var(--bg-2);
+  }
+  .pane{
+    height:var(--pane-h);overflow-y:auto;overflow-x:hidden;
+    padding:0 18px 26px;
+    scrollbar-width:thin;scrollbar-color:var(--line-strong) transparent;
+    overscroll-behavior:contain;
+  }
+  .pane::-webkit-scrollbar{width:10px}
+  .pane::-webkit-scrollbar-thumb{background:var(--line-strong);border-radius:99px;border:3px solid transparent;background-clip:content-box}
+  .pane::-webkit-scrollbar-track{background:transparent}
+  .pane-left{border-right:2px solid var(--line-strong);background:linear-gradient(90deg,transparent 80%,rgba(240,121,124,.028))}
+  .pane-right{background:linear-gradient(270deg,transparent 80%,rgba(74,194,107,.03))}
+
+  .pane-head{
+    position:sticky;top:0;z-index:6;
+    margin:0 -18px 14px;padding:12px 18px 11px;
+    background:var(--bg-2);
+    border-bottom:1px solid var(--line);
+  }
+  html[data-theme="light"] .pane-head{background:var(--bg-2)}
+  .pane-title{display:flex;align-items:center;gap:9px;font-size:15px;font-weight:650}
+  .pane-mark{
+    display:inline-grid;place-items:center;width:20px;height:20px;border-radius:5px;
+    font-family:var(--mono);font-size:11.5px;font-weight:700;flex:none;
+  }
+  .pane-mark--a{background:var(--red-bg);border:1px solid var(--red-line);color:var(--red)}
+  .pane-mark--b{background:var(--green-bg);border:1px solid var(--green-line);color:var(--green)}
+  .pane-sub{font-size:11.5px;color:var(--faint);margin-top:3px;font-family:var(--mono);line-height:1.5}
+
+  /* ── 节点卡片 ───────────────────────────────── */
+  .node{
+    display:flex;flex-direction:column;
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    margin-bottom:12px;overflow:hidden;
+  }
+  .node-head{
+    display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+    padding:7px 12px;background:var(--panel-2);border-bottom:1px solid var(--line-soft);
+    font-family:var(--mono);font-size:11.5px;color:var(--dim);
+  }
+  .node-idx{color:var(--txt);font-weight:600;letter-spacing:.02em}
+  .node-kind{color:var(--faint)}
+  .node-tag{
+    margin-left:auto;font-size:11px;color:var(--faint);
+    border:1px solid var(--line);border-radius:999px;padding:0 8px;background:var(--bg-2);
+  }
+  .node-body{padding:11px 12px 12px;display:flex;flex-direction:column;gap:10px;flex:1}
+  /* 成对节点等高后，让最后一个块吸收剩余高度，避免大块空白 */
+  .node-body > .block:last-child:not(.missing):not(.new){
+    flex:1 1 auto;display:flex;flex-direction:column;
+  }
+  .node-body > .block:last-child:not(.missing):not(.new) > .code{flex:0 0 auto}
+
+  /* 代码块 */
+  .code{
+    margin:0;padding:10px 12px;background:var(--code-bg);
+    border:1px solid var(--line-soft);border-left:2px solid var(--line-strong);border-radius:6px;
+    font-family:var(--mono);font-size:12.2px;line-height:1.58;color:#c9d6e5;
+    white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;
+  }
+  html[data-theme="light"] .code{color:#26313f}
+  .code .k{color:var(--blue)}
+  .code .cm{color:var(--faint)}
+
+  /* 块与差异编码 */
+  .block{position:relative;border-radius:8px}
+  .block-head{
+    display:flex;align-items:center;gap:7px;flex-wrap:wrap;
+    font-size:12.5px;font-weight:600;color:var(--txt-2);margin-bottom:6px;
+  }
+  .block-head .sign{
+    display:inline-grid;place-items:center;width:15px;height:15px;border-radius:4px;
+    font-family:var(--mono);font-size:11px;line-height:1;flex:none;
+  }
+  .block p{margin:6px 0 0;font-size:13px;color:var(--txt-2)}
+  .block p:first-of-type{margin-top:0}
+  .block ul{margin:6px 0 0;padding-left:18px;font-size:13px;color:var(--txt-2)}
+  .block li{margin:2px 0}
+
+  /* 左栏：缺失 / 被压掉的内容 */
+  .block.missing{
+    border:1px dashed var(--red-line);background:var(--red-bg);
+    padding:9px 11px;border-radius:7px;
+  }
+  .block.missing .block-head{color:var(--red)}
+  .block.missing .block-head .sign{background:rgba(240,121,124,.16);color:var(--red);border:1px solid var(--red-line)}
+  .block.missing .code{border-left-color:var(--red-line);color:var(--faint);opacity:.85}
+  .block.missing.fill{flex:1;display:flex;flex-direction:column;justify-content:flex-start}
+  .missing-label{font-size:11px;color:var(--red);font-family:var(--mono);letter-spacing:.04em;opacity:.9}
+  /* 被裁掉的中段：用斜纹占位把「空白」变成可读的信息 */
+  .void{
+    flex:1 1 auto;min-height:52px;margin-top:10px;border-radius:6px;
+    border:1px dashed var(--red-line);
+    background:repeating-linear-gradient(135deg,transparent 0 6px,rgba(240,121,124,.06) 6px 12px);
+    display:flex;align-items:center;justify-content:center;text-align:center;padding:8px;
+    font-family:var(--mono);font-size:11px;line-height:1.5;color:var(--red);opacity:.8;
+  }
+
+  /* 右栏：新增内容 */
+  .block.new{
+    border:1px solid var(--green-line);border-left:3px solid var(--green);
+    background:var(--green-bg);padding:9px 11px;border-radius:7px;
+    box-shadow:inset 0 0 34px rgba(74,194,107,.05);
+  }
+  .block.new .block-head{color:var(--green)}
+  .block.new .block-head .sign{background:rgba(74,194,107,.18);color:var(--green);border:1px solid var(--green-line)}
+  .block.new .code{background:rgba(0,0,0,.26);border-left-color:var(--green)}
+  html[data-theme="light"] .block.new .code{background:#fff}
+  .new-label{font-size:11px;color:var(--green);font-family:var(--mono);letter-spacing:.04em}
+
+  /* 两栏相同的内容 */
+  .block.same{opacity:.82}
+  .block.same .block-head{color:var(--dim)}
+  .block.same .block-head .sign{background:var(--panel-2);color:var(--dim);border:1px solid var(--line)}
+  .same-tag{font-size:11px;color:var(--faint);font-family:var(--mono)}
+
+  /* 增量 token 标签（可点击） */
+  .badge{
+    display:inline-flex;align-items:center;gap:4px;
+    font-family:var(--mono);font-size:11px;font-weight:600;
+    color:var(--green);background:var(--green-bg-2);border:1px solid var(--green-line);
+    border-radius:999px;padding:1px 8px;cursor:pointer;line-height:1.5;
+    transition:.14s;flex:none;
+  }
+  .badge:hover,.badge:focus-visible{background:var(--green);color:#04150a;outline:none}
+  .badge--amber{color:var(--amber);background:var(--amber-bg);border-color:rgba(226,180,65,.36)}
+  .badge--amber:hover,.badge--amber:focus-visible{background:var(--amber);color:#14100a}
+  .badge--ghost{color:var(--dim);background:transparent;border-color:var(--line-strong);cursor:help}
+  .badge--ghost:hover,.badge--ghost:focus-visible{background:var(--panel-2);color:var(--txt)}
+
+  .note{margin:7px 0 0;font-size:12px;color:var(--faint);line-height:1.55}  .note b{color:var(--dim);font-weight:600}
+  .footnote{margin:10px 0 0;font-size:11.5px;color:var(--faint);border-top:1px dotted var(--line);padding-top:7px}
+
+  details{margin:0;border:1px solid var(--line-soft);border-radius:7px;background:var(--bg-2)}
+  details[open]{background:transparent;border-color:transparent}
+  summary{
+    cursor:pointer;list-style:none;padding:6px 10px;font-size:12px;color:var(--dim);
+    font-family:var(--mono);display:flex;align-items:center;gap:7px;border-radius:7px;
+  }
+  summary::-webkit-details-marker{display:none}
+  summary::before{content:"[+]";font-family:var(--mono);color:var(--blue);opacity:.85}
+  details[open] > summary::before{content:"[−]"}
+  details[open] > summary{border-bottom:1px solid var(--line-soft);margin-bottom:8px;color:var(--faint)}
+  summary:hover{color:var(--txt-2)}
+  details .code{margin:0 10px 10px}
+
+  /* 只看新增 模式 */
+  body.focus-new .pane-left .block:not(.missing){opacity:.20;filter:grayscale(.7)}
+  body.focus-new .pane-left .block.missing{opacity:1;border-color:var(--red);border-width:2px;box-shadow:0 0 0 1px rgba(240,121,124,.18)}
+  body.focus-new .pane-right .block:not(.new){opacity:.20;filter:grayscale(.7)}
+  body.focus-new .pane-right .block.new{background:var(--green-bg-2);border-color:var(--green);box-shadow:0 0 0 1px var(--green-line),0 0 24px rgba(74,194,107,.14)}
+  body.focus-new .pane-left .node-head,
+  body.focus-new .pane-right .node-head{opacity:.85}
+
+  /* ── 总结区 ─────────────────────────────────── */
+  .synth{padding:30px 40px 10px;border-top:1px solid var(--line);background:linear-gradient(180deg,var(--bg-2),transparent 40%)}
+  .synth h2{margin:26px 0 10px;font-size:15px;font-weight:650;display:flex;align-items:center;gap:9px}
+  .synth h2 .idx{font-family:var(--mono);font-size:11.5px;color:var(--faint);border:1px solid var(--line-strong);border-radius:5px;padding:1px 6px;font-weight:600}
+  .synth h2:first-of-type{margin-top:0}
+  .table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}
+  table{border-collapse:collapse;width:100%;font-size:13px;min-width:520px}
+  th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line-soft);vertical-align:top}
+  thead th{
+    background:var(--panel-2);color:var(--faint);font-weight:600;
+    font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;white-space:nowrap;
+  }
+  tbody tr:last-child td{border-bottom:0}
+  tbody tr:hover td{background:rgba(110,168,254,.035)}
+  td.q{color:var(--txt-2)}
+  .yes{color:var(--green);font-weight:700;font-family:var(--mono)}
+  .no{color:var(--red);font-weight:700;font-family:var(--mono)}
+  .part{color:var(--amber);font-weight:700;font-family:var(--mono)}
+  .cell{display:flex;gap:8px;align-items:baseline}
+  .cell .txt{color:var(--txt-2);font-size:12.5px}
+  .cell .txt.dimmed{color:var(--faint)}
+  tr.sum td{background:var(--green-bg);font-weight:600}
+  tr.sum td .cell .txt{color:var(--txt)}
+  .num{font-family:var(--mono);color:var(--txt)}
+
+  .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  .card{
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:14px 16px;min-width:0;
+  }
+  .card h3{margin:0 0 8px;font-size:13px;font-weight:650;color:var(--txt)}
+  .card h3 .n{font-family:var(--mono);font-size:11px;color:var(--blue);margin-right:6px}
+  .card p{margin:0;font-size:12.8px;color:var(--txt-2)}
+  .card blockquote{
+    margin:8px 0 0;padding:8px 11px;border-left:2px solid var(--blue);
+    background:var(--bg-2);border-radius:0 6px 6px 0;font-size:12.4px;color:var(--dim);
+  }
+  .card--warn{border-color:var(--red-line);background:linear-gradient(180deg,var(--red-bg),transparent 60%)}
+  .card--warn h3{color:var(--red)}
+
+  .diff{
+    margin:0;padding:11px 13px;background:var(--code-bg);border:1px solid var(--line);
+    border-radius:8px;font-family:var(--mono);font-size:12.2px;line-height:1.62;
+    white-space:pre-wrap;word-break:break-word;color:var(--txt-2);
+  }
+  .diff .add{color:var(--green)}
+  .diff .ctx{color:var(--faint)}
+
+  .honest{
+    border:1px solid rgba(226,180,65,.34);border-radius:var(--radius);
+    background:linear-gradient(180deg,var(--amber-bg),transparent 70%);
+    padding:16px 18px;
+  }
+  .honest h2{margin:0 0 10px;color:var(--amber);font-size:14.5px}
+  .honest ul{margin:0;padding-left:18px}
+  .honest li{margin:6px 0;font-size:13px;color:var(--txt-2)}
+  .honest li b{color:var(--txt)}
+  .honest .tag{
+    display:inline-block;font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;
+    border:1px solid rgba(226,180,65,.4);color:var(--amber);border-radius:4px;
+    padding:0 5px;margin-right:6px;vertical-align:1px;text-transform:uppercase;
+  }
+
+  footer{padding:22px 40px 40px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
+  footer .row{display:flex;flex-wrap:wrap;gap:6px 20px}
+  footer a{color:var(--dim);text-decoration:none;border-bottom:1px dotted var(--line-strong)}
+  footer a:hover{color:var(--blue)}
+
+  /* ── 浮动提示 ───────────────────────────────── */
+  .popover{
+    position:fixed;z-index:99;max-width:340px;
+    background:#0a0e14;color:var(--txt);
+    border:1px solid var(--green-line);border-radius:9px;
+    box-shadow:0 14px 34px rgba(0,0,0,.55),0 0 0 1px rgba(74,194,107,.06);
+    padding:11px 13px;font-size:12.6px;line-height:1.6;
+  }
+  html[data-theme="light"] .popover{background:#fff;box-shadow:0 14px 34px rgba(20,30,45,.18)}
+  .popover[hidden]{display:none}
+  .popover h4{margin:0 0 3px;font-size:12.8px;color:var(--green);font-weight:650}
+  .popover .where{font-family:var(--mono);font-size:10.8px;color:var(--faint);margin-bottom:7px}
+  .popover p{margin:0;color:var(--txt-2)}
+  .popover .cost{
+    margin-top:8px;padding-top:7px;border-top:1px dotted var(--line-strong);
+    font-family:var(--mono);font-size:11px;color:var(--dim);
+  }
+
+  /* ── 响应式：窄屏降级为上下堆叠 ──────────────── */
+  @media (max-width:1100px){
+    .scn-grid{grid-template-columns:repeat(2,1fr)}
+    .grid-3{grid-template-columns:1fr}
+  }
+  @media (max-width:900px){
+    .page-head,.span,.synth,footer{padding-left:20px;padding-right:20px}
+    .toolbar{padding-left:20px;padding-right:20px}
+    .toolbar .hint{display:none}
+    .compare{grid-template-columns:1fr}
+    .pane{height:auto;max-height:none;overflow:visible;padding:0 20px 18px}
+    .pane-left{border-right:0;border-bottom:2px solid var(--line-strong)}
+    .pane-right{padding-top:18px}
+    .pane-head{position:static;margin:0 0 12px;padding-left:0;padding-right:0;background:transparent;border-bottom:1px solid var(--line)}
+    .node{min-height:0 !important}
+    .scn-grid{grid-template-columns:1fr}
+    .page-head h1{font-size:22px}
+  }
+
+  /* ── 打印：保持左右并排 ─────────────────────── */
+  @page{margin:12mm 10mm}
+  @media print{
+    html[data-theme="dark"]{
+      --bg:#fff;--bg-2:#fff;--panel:#fff;--panel-2:#f4f6f9;--code-bg:#f8fafc;
+      --line:#ccd5e0;--line-soft:#dde4ec;--line-strong:#b6c2d0;
+      --txt:#111a24;--txt-2:#2c3947;--dim:#4c5a6b;--faint:#6d7a8a;
+      --green:#106b34;--green-bg:rgba(16,107,52,.07);--green-bg-2:rgba(16,107,52,.13);--green-line:rgba(16,107,52,.4);
+      --red:#9c2320;--red-bg:rgba(156,35,32,.05);--red-line:rgba(156,35,32,.32);
+      --amber:#7a5600;--amber-bg:rgba(122,86,0,.08);
+      --strong:#000;
+    }
+    body{background:#fff !important;font-size:11px}
+    .toolbar,.popover{display:none !important}
+    .compare{grid-template-columns:1fr 1fr !important;background:#fff}
+    .pane{height:auto !important;max-height:none !important;overflow:visible !important;padding:0 10px 0 0}
+    .pane-right{padding:0 0 0 10px}
+    .pane-head{position:static !important;background:#fff !important}
+    .node{min-height:0 !important;page-break-inside:avoid;break-inside:avoid;margin-bottom:8px;box-shadow:none}
+    .span,.synth,footer{page-break-inside:avoid;break-inside:avoid}
+    .scn-grid{grid-template-columns:repeat(2,1fr)}
+    .grid-3{grid-template-columns:repeat(3,1fr)}
+    .code,.diff{font-size:9.6px;line-height:1.45}
+    table{min-width:0;font-size:10px;page-break-inside:avoid}
+    .badge{box-shadow:none}
+    a{color:inherit;text-decoration:none}
+    body.focus-new .pane-left .block,
+    body.focus-new .pane-right .block{opacity:1 !important;filter:none !important}
+  }
+
+  @media (prefers-reduced-motion:reduce){
+    *{transition:none !important}
+  }
+</style>
+</head>
+<body>
+
+<!-- ═══════════ 标题区 ═══════════ -->
+<header class="page-head">
+  <div class="eyebrow">上下文架构评审 · 可视化交付物</div>
+  <h1>模型收到的上下文：修改前 vs 修改后</h1>
+  <p class="lede">
+    同一时刻、同一个问题、同一份真实数据下的两个版本。左栏是今天模型真正收到的东西，
+    右栏是同一个上下文加上三处改动后的样子 —— 净增约 <em>215 tokens</em>，
+    不到工具 schema 的 1.8%，却决定了模型「知不知道自己站在哪儿」。
+  </p>
+  <div class="src-line">
+    <span>蓝本：docs/9F-full-context-comparison.md</span>
+    <span>数字：docs/98-compaction-findings.md（实测）</span>
+    <span>标记格式：docs/9B-dsh-source-findings.md（源码常量）</span>
+    <span>细对照：docs/9E-example-before-after.md</span>
+  </div>
+</header>
+
+<!-- ═══════════ 工具条 ═══════════ -->
+<div class="toolbar" role="region" aria-label="视图控制">
+  <label class="switch" for="onlyNew">
+    <input type="checkbox" id="onlyNew">
+    <span class="track" aria-hidden="true"></span>
+    <span class="txt">只看新增</span>
+  </label>
+  <label class="switch" for="syncScroll">
+    <input type="checkbox" id="syncScroll" checked>
+    <span class="track" aria-hidden="true"></span>
+    <span class="txt">联动滚动</span>
+  </label>
+  <button type="button" class="btn" id="themeBtn">切换到浅色</button>
+  <button type="button" class="btn" id="expandBtn">折叠全部摘要</button>
+  <span class="hint">两栏各有独立滚动条；关掉「联动滚动」即可分别翻阅。</span>
+</div>
+
+<!-- ═══════════ 场景说明区（横跨两栏） ═══════════ -->
+<section class="span" aria-labelledby="scn-h">
+  <h2 class="span-title" id="scn-h"><span class="bar"></span>场景：一次真实的第 21 轮提问<span class="t-sub">session-9ecf69ac · super-feiyu</span></h2>
+  <div class="scn-grid">
+    <div class="scn-card">
+      <h3>项目 / 任务</h3>
+      <p><b>super-feiyu</b> —— 一个 2C1G 可部署的 C++ 聊天机器人。第 1 轮用户要求：用 C++ modules 重写、职责分离、短时记忆与长时记忆分离。</p>
+    </div>
+    <div class="scn-card scn-card--warn">
+      <h3>用户的硬约束（第 1 轮说过）</h3>
+      <ul class="quote-list">
+        <li>「所有上限必须让我明确批准才能加」</li>
+        <li>「优先模块不是一定模块」</li>
+      </ul>
+      <p class="muted">两条都说过，但都只存在于第 1 轮的原文里 —— 而第 1 轮已经被压缩掉了。</p>
+    </div>
+    <div class="scn-card">
+      <h3>已发生的事（真实链路）</h3>
+      <ol class="flow">
+        <li>第 1 轮读入大量源码，单轮约 <b>48 万 token</b></li>
+        <li>压缩触发，遮蔽 <b>2,143 条事件 / 479,142 tokens</b>（seq 41–2184）</li>
+        <li>大型工具结果被 prune：单条 <b>18,006 → 5,159 字符</b>（−71.3%）；59 次合计 1,166,597 → 304,427（−73.9%）</li>
+        <li>模型继续工作，现在遇到一个新请求</li>
+      </ol>
+    </div>
+    <div class="scn-card scn-card--ask">
+      <h3>现在用户问</h3>
+      <p class="ask">给 buffer 加上限，50% 吧</p>
+      <p class="muted">下面两栏，就是模型收到这句话时，上下文里真正有的东西。</p>
+    </div>
+  </div>
+  <div class="chips">
+    <span class="chip">遮蔽事件 <b>2,143</b></span>
+    <span class="chip">释放 tokens <b>479,142</b></span>
+    <span class="chip">seq 范围 <b>41–2184</b></span>
+    <span class="chip">单次裁剪 <b>12,847 字符</b></span>
+    <span class="chip">单条 18,006 → 5,159 <b>−71.3%</b></span>
+    <span class="chip">系统提示 <b>1,682 tokens</b></span>
+    <span class="chip">工具 schema <b>12,139 tokens</b></span>
+    <span class="chip chip--g">本方案净增 <b>≈ 215 tokens</b></span>
+  </div>
+</section>
+
+<!-- ═══════════ 左右两栏对比 ═══════════ -->
+<section class="compare" aria-label="修改前后逐节点对比">
+
+  <!-- ─────────── 左栏 ─────────── -->
+  <div class="pane pane-left" id="paneLeft" tabindex="0" aria-label="修改前 · 当前架构">
+    <div class="pane-head">
+      <div class="pane-title"><span class="pane-mark pane-mark--a">A</span>修改前 · 当前架构</div>
+      <div class="pane-sub">模型真实收到的全部内容 · 系统提示 1,682 tokens + 工具 schema 12,139 tokens（每步重新计入）</div>
+    </div>
+
+    <!-- node 0 -->
+    <article class="node" data-pair="n0">
+      <div class="node-head">
+        <span class="node-idx">node 0</span>
+        <span class="node-kind">system/message</span>
+        <span class="node-tag">~1,682 tokens</span>
+      </div>
+      <div class="node-body">
+        <div class="block">
+          <div class="block-head"><span class="sign">·</span>system prompt 正文（渲染后的 node 0）</div>
+          <pre class="code">You are an AI agent powered by DeepSeek Harness.
+You are a coding agent running on deepseek-v4.1-flash.
+
+[coding persona …]
+[AGENTS.md 内容：语言偏好、Python 规范、C++ 规范、安全习惯 …]</pre>
+        </div>
+        <div class="block missing fill">
+          <div class="block-head"><span class="sign">−</span>此处没有 Hard rules 固定段</div>
+          <p>「所有上限必须让我明确批准才能加」不在 node 0。它只出现在 node 1 摘要正文的 12 条 bullet 中间，
+             形态是 <code>**Hard rule (verbatim)**: "…"</code> —— 一个<b>标签</b>，不是一条<b>规则</b>：
+             没有触发条件、没有作用范围、没有撤销状态。</p>
+          <p class="note"><b>为什么位置重要：</b>node 0 是唯一永不被压缩遮蔽的节点
+             （<code>selectCompactableRange()</code> 从第 1 号节点起才算候选）。
+             写在这里的规则「永不被压」；写在摘要里的规则，随每次再压缩衰减一次。</p>
+          <p class="footnote">本次请求的 system prompt 里，跨轮次用户约束的存活率 = 0。</p>
+        </div>
+      </div>
+    </article>
+
+    <!-- node 1 -->
+    <article class="node" data-pair="n1">
+      <div class="node-head">
+        <span class="node-idx">node 1</span>
+        <span class="node-kind">user/message · 压缩检查点</span>
+        <span class="node-tag">替换 seq 41–2184</span>
+      </div>
+      <div class="node-body">
+        <div class="block">
+          <div class="block-head"><span class="sign">·</span>固定前言（CHECKPOINT_PREAMBLE，17/17 次都注入）</div>
+          <pre class="code">This is an automatically generated checkpoint condensing an earlier span of
+the conversation to free up context. Treat the captured context as established
+background and build on it without restating it. Continue the task directly from
+the messages that follow, without acknowledging this checkpoint.</pre>
+        </div>
+
+        <div class="block">
+          <div class="block-head"><span class="sign">·</span>compacted-summary 正文（8 个固定小节）</div>
+          <details open>
+            <summary>摘要正文 · 按摘要 prompt 的 8 个要求重建（点击折叠）</summary>
+            <pre class="code">&lt;compacted-summary&gt;
+
+## Primary Request and Intent
+- Original: "给我找一个2c1g Ubuntu可部署的DeepSeek大肥鱼项目"
+- Then: "都太烂了，自己做一个，给出架构来，要职责分离，c++写"
+- Memory design: "短时记忆（上下文/内存）和长时记忆分离"
+- Config: "配置允许各种各样的key…采用一套相同的接口"
+- Module preference: "尽量用模块吧，头文件构建太费劲了"
+    → later "换个编译器，clang或者升级下gcc…优先模块不是一定模块"
+- **Hard rule (verbatim)**: "所有上限必须让我明确批准才能加"
+- "现在全都用api，本地只做转发和存储"
+
+## Key Technical Concepts
+- C++20 modules via clang 21.1.8, single-file module pattern
+- libcurl native WebSocket
+- SQLite WAL + brute-force cosine recall
+- TokenBudget::make(model_context_tokens, raw_ratio, summary_ratio);
+  CJK ≈ 1 token/char, ASCII ≈ 1/4
+- RRF fusion (k=60)
+
+## Files and Code
+- `src/fish.core.cppm` — domain types, Result&lt;T&gt;, interfaces
+- `src/fish.log.cppm` — JSON single-line logger
+- `src/fish.memory.cppm` — 3-layer memory;
+  WorkingMemory(keep_rounds), NotesStore, IndexStore,
+  Consolidator, MemorySystem
+- `src/fish.capability.cppm` — HttpClient (retry/backoff)
+
+## Errors and Fixes
+- clang forbids impl unit importing its own module
+    → use `module :private;`
+- Modules cannot export macros → logging via log_line()
+
+## Pending Jobs
+- QQ official Bot path (先b)
+
+## Current Work
+- 实现 TokenBudget 与历史窗口管理
+
+## Next Step
+- 继续实现 MemorySystem::compact()
+
+## Critical Context
+- 侧车 Markdown 为权威源，SQLite 索引可重建
+- Session 隔离：notes/&lt;group|user&gt;/&lt;safe_id&gt;/
+
+&lt;/compacted-summary&gt;</pre>
+          </details>
+          <p class="footnote">摘要正文是按 8 个固定小节<b>重建的示意</b>，措辞非原文（见页底诚实标注）。
+             实测摘要模型每次输出 2,333–4,348 tokens。</p>
+        </div>
+
+        <div class="block missing fill">
+          <div class="block-head"><span class="sign">−</span>检查点到此结束，没有任何完整性声明</div>
+          <p>前言是唯一的告知：它说「有一个检查点」，<b>不说</b>丢了多少条事件、释放多少 token、
+             原文在哪个 seq 区间、怎么取回、和硬规则冲突时信谁。</p>
+          <p class="note"><b>实测：</b>17/17 次注入都有前言与标签；<b>0/17</b> 次包含「遮蔽了多少」的计数。
+             被遮蔽的 15,768 个节点在模型可见层<b>没有留下任何可回溯句柄</b>。</p>
+          <p class="footnote">模型无法对自己的记忆完整度做校准 —— 它会像对待完整历史一样对待一份有损代理。</p>
+        </div>
+      </div>
+    </article>
+
+    <!-- node 2 ~ n -->
+    <article class="node" data-pair="n2">
+      <div class="node-head">
+        <span class="node-idx">node 2 ~ n</span>
+        <span class="node-kind">保留的近期消息（verbatim）</span>
+        <span class="node-tag">尾部逐字保留</span>
+      </div>
+      <div class="node-body">
+        <div class="block">
+          <div class="block-head"><span class="sign">·</span>工具往返</div>
+          <pre class="code">assistant: [继续实现 compact()，读取 fish.memory.cppm]
+tool_call: read("src/fish.memory.cppm")</pre>
+        </div>
+
+        <div class="block missing fill">
+          <div class="block-head"><span class="sign">−</span>tool_result：被裁剪后只剩一行无规模标记</div>
+          <pre class="code">&lt;前 4096 字符&gt;
+
+[... tool result middle pruned ...]
+
+&lt;后 1024 字符&gt;</pre>
+          <p>标记里<b>没有任何量化信息</b>：不说省了多少字符、原来多大、原文在哪、怎么取回。
+             59/59 次 prune 都是这个形态。</p>
+          <p class="note"><b>不对称很刺眼：</b>工具结果被裁时模型<b>看得见</b>「中段被裁」，
+             历史被摘要时却<b>看不见</b>「少了多少」。</p>
+          <p class="footnote">prune 的 <code>data</code> 只有 <code>{shadowedRange, shadowedSeqs, shadowedTokenCount}</code>，
+             没有内容副本，也不落 spill 文件。</p>
+          <div class="void" aria-hidden="true">此处原有一段内容<br>模型不知道它有多长、在哪、还能不能拿回来</div>
+        </div>
+      </div>
+    </article>
+
+    <!-- node n+1 -->
+    <article class="node" data-pair="n3">
+      <div class="node-head">
+        <span class="node-idx">node n+1</span>
+        <span class="node-kind">user/message · runtime context</span>
+        <span class="node-tag">两栏相同</span>
+      </div>
+      <div class="node-body">
+        <div class="block same">
+          <div class="block-head"><span class="sign">=</span>system-reminder<span class="same-tag">两栏完全一致</span></div>
+          <pre class="code">&lt;system-reminder&gt;
+Current time: 2026-11-13T22:41:03+08:00
+Working directory: C:\Users\Assistant\projects\super-feiyu
+Sandbox mode: workspace-write
+&lt;/system-reminder&gt;</pre>
+          <p class="note">走独立通道：渲染成一条 user 消息追加在历史尾部，内容不变就不重复注入。
+             它也是全系统唯一带「我覆盖了旧版本」声明的通道 —— 但该声明<b>只覆盖 runtime context，
+             不覆盖对话内容</b>。</p>
+        </div>
+      </div>
+    </article>
+
+    <!-- node n+2 -->
+    <article class="node" data-pair="n4">
+      <div class="node-head">
+        <span class="node-idx">node n+2</span>
+        <span class="node-kind">user/message</span>
+        <span class="node-tag">两栏相同</span>
+      </div>
+      <div class="node-body">
+        <div class="block same">
+          <div class="block-head"><span class="sign">=</span>用户此刻的提问<span class="same-tag">两栏完全一致</span></div>
+          <pre class="code">给 buffer 加上限，50% 吧</pre>
+          <p class="note">模型必须在此刻判断：这算不算「新增或调整了一个数值上限」。
+             左栏的上下文里没有任何材料能回答这个问题 —— 只有在 12 条 bullet 中间卧着的那一行标签。</p>
+        </div>
+      </div>
+    </article>
+  </div>
+
+  <!-- ─────────── 右栏 ─────────── -->
+  <div class="pane pane-right" id="paneRight" tabindex="0" aria-label="修改后 · 改进方案">
+    <div class="pane-head">
+      <div class="pane-title"><span class="pane-mark pane-mark--b">B</span>修改后 · 改进方案</div>
+      <div class="pane-sub">三处改动 · 净增约 215 tokens · 占工具 schema(12,139) 的 1.8%</div>
+    </div>
+
+    <!-- node 0 -->
+    <article class="node" data-pair="n0">
+      <div class="node-head">
+        <span class="node-idx">node 0</span>
+        <span class="node-kind">system/message</span>
+        <span class="node-tag">~1,802 tokens</span>
+      </div>
+      <div class="node-body">
+        <div class="block same">
+          <div class="block-head"><span class="sign">=</span>persona + AGENTS.md<span class="same-tag">与左栏相同</span></div>
+          <pre class="code">You are an AI agent powered by DeepSeek Harness.
+You are a coding agent running on deepseek-v4.1-flash.
+
+[coding persona …]
+[AGENTS.md 内容：语言偏好、Python 规范、C++ 规范、安全习惯 …]</pre>
+        </div>
+
+        <div class="block new">
+          <div class="block-head">
+            <span class="sign">+</span><span class="new-label">新增 · 改动 1</span>
+            Hard rules 固定段（永不被压缩，优先级高于摘要）
+            <button type="button" class="badge" data-tip="hardrules">+120 tokens</button>
+          </div>
+          <pre class="code">## Hard rules (from the user, verbatim, must be obeyed)
+
+- [R1] "所有上限必须让我明确批准才能加"
+  → 任何数值上限（buffer/queue/cache/超时/token 预算）的新增或调整，
+    先问「这算不算加了一个上限」，得到明确同意才动手。
+  → 首次出现于 seq 41，从未被撤销。
+
+- [R2] "优先模块不是一定模块"
+  → 优先用 C++ modules；遇到编译器/构建阻塞时可退回头文件，
+    但退回前要说明原因。
+  → 这是让步，不是目标。首次出现于 seq 312。
+
+- [R3] "先别管github，先规划，不要开始写"
+  → 已被后续指令取代（seq 2210 之后开始实现）。已失效。
+
+若本区与摘要或其他历史冲突，以本区为准。</pre>
+          <ul>
+            <li><b>不是新规则</b>：全部是用户第 1 轮原话逐字引用，只加了「可执行化 + seq 溯源 + 撤销状态」。</li>
+            <li><b>R3 反例很重要</b>：一条已失效的规则也照实写出来并标注失效 —— 否则模型会把过期约束当现行禁令。</li>
+            <li><b>末句是优先级声明</b>：这是整套方案里唯一让「冲突」变成可判定情况的地方。</li>
+          </ul>
+          <p class="note"><b>依据：</b>Claude Code 的 <code>What survives compaction</code> 表证明 —— 必须跨压缩存活的规则
+             要<b>从磁盘重新注入</b>，路径作用域规则会被摘要掉（9C §4.1）。此处是同一原理的直接应用。</p>
+        </div>
+      </div>
+    </article>
+
+    <!-- node 1 -->
+    <article class="node" data-pair="n1">
+      <div class="node-head">
+        <span class="node-idx">node 1</span>
+        <span class="node-kind">user/message · 压缩检查点</span>
+        <span class="node-tag">替换 seq 41–2184</span>
+      </div>
+      <div class="node-body">
+        <div class="block same">
+          <div class="block-head"><span class="sign">=</span>固定前言<span class="same-tag">与左栏逐字相同</span></div>
+          <pre class="code">This is an automatically generated checkpoint condensing an earlier span of
+the conversation to free up context. Treat the captured context as established
+background and build on it without restating it. Continue the task directly from
+the messages that follow, without acknowledging this checkpoint.</pre>
+        </div>
+
+        <div class="block same">
+          <div class="block-head"><span class="sign">=</span>compacted-summary 正文<span class="same-tag">与左栏逐字相同（8 小节）</span></div>
+          <details open>
+            <summary>摘要正文一字未改 —— 可与左栏逐行对照（点击折叠）</summary>
+            <pre class="code">&lt;compacted-summary&gt;
+
+## Primary Request and Intent
+- Original: "给我找一个2c1g Ubuntu可部署的DeepSeek大肥鱼项目"
+- Then: "都太烂了，自己做一个，给出架构来，要职责分离，c++写"
+- Memory design: "短时记忆（上下文/内存）和长时记忆分离"
+- Config: "配置允许各种各样的key…采用一套相同的接口"
+- Module preference: "尽量用模块吧，头文件构建太费劲了"
+    → later "换个编译器，clang或者升级下gcc…优先模块不是一定模块"
+- **Hard rule (verbatim)**: "所有上限必须让我明确批准才能加"
+- "现在全都用api，本地只做转发和存储"
+
+## Key Technical Concepts
+- C++20 modules via clang 21.1.8, single-file module pattern
+- libcurl native WebSocket
+- SQLite WAL + brute-force cosine recall
+- TokenBudget::make(model_context_tokens, raw_ratio, summary_ratio);
+  CJK ≈ 1 token/char, ASCII ≈ 1/4
+- RRF fusion (k=60)
+
+## Files and Code
+- `src/fish.core.cppm` — domain types, Result&lt;T&gt;, interfaces
+- `src/fish.log.cppm` — JSON single-line logger
+- `src/fish.memory.cppm` — 3-layer memory;
+  WorkingMemory(keep_rounds), NotesStore, IndexStore,
+  Consolidator, MemorySystem
+- `src/fish.capability.cppm` — HttpClient (retry/backoff)
+
+## Errors and Fixes
+- clang forbids impl unit importing its own module
+    → use `module :private;`
+- Modules cannot export macros → logging via log_line()
+
+## Pending Jobs
+- QQ official Bot path (先b)
+
+## Current Work
+- 实现 TokenBudget 与历史窗口管理
+
+## Next Step
+- 继续实现 MemorySystem::compact()
+
+## Critical Context
+- 侧车 Markdown 为权威源，SQLite 索引可重建
+- Session 隔离：notes/&lt;group|user&gt;/&lt;safe_id&gt;/
+
+&lt;/compacted-summary&gt;</pre>
+          </details>
+        </div>
+
+        <div class="block new">
+          <div class="block-head">
+            <span class="sign">+</span><span class="new-label">新增 · 改动 2</span>
+            检查点末尾的三行完整性声明
+            <button type="button" class="badge" data-tip="integrity">+55 tokens</button>
+          </div>
+          <pre class="code">[compacted: 2,143 events (seq 41–2184) · 479,142 tokens released at 22:41
+ — verbatim history readable: session_query(seq_from=41, seq_to=2184)
+ — Hard rules 区优先于本摘要；若冲突以那边为准]</pre>
+          <ul>
+            <li><b>量化</b>：2,143 条 / 479,142 tokens —— 不再是「有个检查点」。</li>
+            <li><b>可操作</b>：给出区间与取回命令，而不是「你丢了东西」。</li>
+            <li><b>优先级</b>：与 Hard rules 冲突时以那边为准 —— 两处各写一遍，方向一致。</li>
+          </ul>
+          <p class="note"><b>实现成本极低：</b><code>shadowedSeqs</code> / <code>shadowedTokenCount</code> /
+             <code>shadowedRange</code> 已经躺在 <code>compaction/summary</code> 事件里（17/17 全有），
+             只是从不进入 surface。多写一行就够。</p>
+          <p class="footnote">注意：它<b>不说</b>「你的上下文被压缩了，请小心」。指针优于告知 ——
+             同样的 token 预算，前者买到能力，后者只买到焦虑（9C §4.5）。</p>
+        </div>
+      </div>
+    </article>
+
+    <!-- node 2 ~ n -->
+    <article class="node" data-pair="n2">
+      <div class="node-head">
+        <span class="node-idx">node 2 ~ n</span>
+        <span class="node-kind">保留的近期消息（verbatim）</span>
+        <span class="node-tag">尾部逐字保留</span>
+      </div>
+      <div class="node-body">
+        <div class="block same">
+          <div class="block-head"><span class="sign">=</span>工具往返<span class="same-tag">与左栏相同</span></div>
+          <pre class="code">assistant: [继续实现 compact()，读取 fish.memory.cppm]
+tool_call: read("src/fish.memory.cppm")</pre>
+        </div>
+
+        <div class="block new">
+          <div class="block-head">
+            <span class="sign">+</span><span class="new-label">新增 · 改动 3</span>
+            tool_result：带规模 + spill 路径 + 取法
+            <button type="button" class="badge" data-tip="prune">+40 tokens</button>
+          </div>
+          <pre class="code">&lt;前 4096 字符&gt;
+
+[pruned: 12,847 chars omitted (18,006 → 5,159, -71.3%)
+ · full result spilled to:
+   /…/session-9ecf…/…-tool-result-7731.txt
+ · recover: read(path, offset=4096)
+            or grep(path, pattern)]
+
+&lt;后 1024 字符&gt;</pre>
+          <ul>
+            <li><b>规模</b>：12,847 字符、压缩比 −71.3% —— 模型知道自己少了多少。</li>
+            <li><b>位置</b>：spill 文件绝对路径，30 天内有效。</li>
+            <li><b>取法</b>：<code>read(path, offset=4096)</code> 或 <code>grep(path, pattern)</code> —— 一个闭环。</li>
+          </ul>
+          <p class="note"><b>不用从零设计：</b><code>dsh-spill-policy</code> 已经会输出
+             「Full formatted result stored at: … Use read with offset/limit, or grep this path」。
+             pruner 有完全等价的机会写这句话，却没有写（9B §3.6）。照抄格式即可。</p>
+        </div>
+      </div>
+    </article>
+
+    <!-- node n+1 -->
+    <article class="node" data-pair="n3">
+      <div class="node-head">
+        <span class="node-idx">node n+1</span>
+        <span class="node-kind">user/message · runtime context</span>
+        <span class="node-tag">两栏相同</span>
+      </div>
+      <div class="node-body">
+        <div class="block same">
+          <div class="block-head"><span class="sign">=</span>system-reminder<span class="same-tag">与左栏完全一致</span></div>
+          <pre class="code">&lt;system-reminder&gt;
+Current time: 2026-11-13T22:41:03+08:00
+Working directory: C:\Users\Assistant\projects\super-feiyu
+Sandbox mode: workspace-write
+&lt;/system-reminder&gt;</pre>
+          <p class="note">这个节点<b>不改</b>。它是全系统唯一有「去重注入」的通道，也是最像「正确做法」的现有实现 ——
+             本方案只是把同样的诚实，补给另外两条路。</p>
+        </div>
+      </div>
+    </article>
+
+    <!-- node n+2 -->
+    <article class="node" data-pair="n4">
+      <div class="node-head">
+        <span class="node-idx">node n+2</span>
+        <span class="node-kind">user/message</span>
+        <span class="node-tag">两栏相同</span>
+      </div>
+      <div class="node-body">
+        <div class="block same">
+          <div class="block-head"><span class="sign">=</span>用户此刻的提问<span class="same-tag">与左栏完全一致</span></div>
+          <pre class="code">给 buffer 加上限，50% 吧</pre>
+          <p class="note">问题一个字没变，数据一个字没变。变的是模型此刻手上有 R1 的触发条件：
+             「任何数值上限的新增或调整，先问，得到明确同意才动手」。</p>
+        </div>
+      </div>
+    </article>
+  </div>
+</section>
+
+<!-- ═══════════ 对照总结区（横跨两栏） ═══════════ -->
+<section class="synth" aria-labelledby="sum-h">
+  <h2 class="span-title" id="sum-h"><span class="bar"></span>对照总结：这三处改动到底改变了什么</h2>
+
+  <h2><span class="idx">1</span>模型此刻能知道什么</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th style="width:36%">问题</th><th style="width:32%">修改前</th><th style="width:32%">修改后</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="q">历史被压缩过吗？</td>
+          <td><span class="cell"><span class="part">△</span><span class="txt">只看到 “automatically generated checkpoint” 这一定性说明</span></span></td>
+          <td><span class="cell"><span class="yes">✓</span><span class="txt">同样看到，另加三行声明</span></span></td>
+        </tr>
+        <tr>
+          <td class="q">压缩掉了多少条事件？</td>
+          <td><span class="cell"><span class="no">✗</span><span class="txt dimmed">完全不知道</span></span></td>
+          <td><span class="cell"><span class="yes">✓</span><span class="txt"><b>2,143 条</b></span></span></td>
+        </tr>
+        <tr>
+          <td class="q">释放了多少 token？</td>
+          <td><span class="cell"><span class="no">✗</span><span class="txt dimmed">完全不知道</span></span></td>
+          <td><span class="cell"><span class="yes">✓</span><span class="txt"><b>479,142</b></span></span></td>
+        </tr>
+        <tr>
+          <td class="q">原文在哪？</td>
+          <td><span class="cell"><span class="no">✗</span><span class="txt dimmed">不知道；日志里有，但模型无通道</span></span></td>
+          <td><span class="cell"><span class="yes">✓</span><span class="txt">seq 41–2184</span></span></td>
+        </tr>
+        <tr>
+          <td class="q">怎么取回？</td>
+          <td><span class="cell"><span class="no">✗</span><span class="txt dimmed">不知道有检索通道（tool-session-query 未挂载）</span></span></td>
+          <td><span class="cell"><span class="yes">✓</span><span class="txt"><code>session_query(seq_from=41, seq_to=2184)</code></span></span></td>
+        </tr>
+        <tr>
+          <td class="q">那个 tool_result 中间少了什么？</td>
+          <td><span class="cell"><span class="no">✗</span><span class="txt dimmed">连字符数都没有</span></span></td>
+          <td><span class="cell"><span class="yes">✓</span><span class="txt"><b>12,847 字符</b>（−71.3%）</span></span></td>
+        </tr>
+        <tr>
+          <td class="q">少了的内容能取回吗？</td>
+          <td><span class="cell"><span class="no">✗</span><span class="txt dimmed">不知道；prune 不落盘、标记无路径</span></span></td>
+          <td><span class="cell"><span class="yes">✓</span><span class="txt">spill 路径 + <code>read</code> / <code>grep</code> 用法</span></span></td>
+        </tr>
+        <tr>
+          <td class="q">「所有上限必须让我明确批准」这条还有效吗？</td>
+          <td><span class="cell"><span class="part">△</span><span class="txt">摘要里有，但只是 12 条 bullet 之一</span></span></td>
+          <td><span class="cell"><span class="yes">✓</span><span class="txt"><b>R1，从未被撤销</b>，在 node 0</span></span></td>
+        </tr>
+        <tr>
+          <td class="q">它具体约束什么？</td>
+          <td><span class="cell"><span class="no">✗</span><span class="txt dimmed">没有触发条件、没有范围</span></span></td>
+          <td><span class="cell"><span class="yes">✓</span><span class="txt">任何数值上限的新增或调整，先问再动</span></span></td>
+        </tr>
+        <tr>
+          <td class="q">摘要和硬规则冲突时信谁？</td>
+          <td><span class="cell"><span class="no">✗</span><span class="txt dimmed">未定义</span></span></td>
+          <td><span class="cell"><span class="yes">✓</span><span class="txt">以 Hard rules 为准（node 0 与 node 1 两处都写明）</span></span></td>
+        </tr>
+        <tr>
+          <td class="q">「优先模块不是一定模块」是什么性质？</td>
+          <td><span class="cell"><span class="no">✗</span><span class="txt dimmed">上下文丢了 —— 是让步还是目标？</span></span></td>
+          <td><span class="cell"><span class="yes">✓</span><span class="txt">让步，不是目标（seq 312）</span></span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2><span class="idx">2</span>逐项对照</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th style="width:22%">维度</th><th style="width:39%">修改前</th><th style="width:39%">修改后</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="q">压缩告知</td>
+          <td>“有个检查点”</td>
+          <td><b>遮蔽 2,143 条 / 479,142 tokens，seq 41–2184</b></td>
+        </tr>
+        <tr>
+          <td class="q">能否取回</td>
+          <td><span class="no">✗</span> 不知道有通道</td>
+          <td><span class="yes">✓</span> <code>session_query(seq_from, seq_to)</code></td>
+        </tr>
+        <tr>
+          <td class="q">裁剪告知</td>
+          <td>无规模、无路径、无取法</td>
+          <td><code>12,847 chars omitted</code> + spill 路径 + 取法</td>
+        </tr>
+        <tr>
+          <td class="q">硬约束的载体</td>
+          <td>摘要正文里的一个 bullet</td>
+          <td><b>system prompt 固定段（node 0），永不被压</b></td>
+        </tr>
+        <tr>
+          <td class="q">硬约束的形态</td>
+          <td><code>**Hard rule (verbatim)**: "…"</code> —— 标签</td>
+          <td><b>可执行规则 + 触发条件 + seq 溯源 + 撤销状态</b></td>
+        </tr>
+        <tr>
+          <td class="q">压缩对它的影响</td>
+          <td><span class="part">△</span> 随摘要逐次衰减，再压一次可能消失</td>
+          <td><span class="yes">✓</span> 永不被遮蔽（node 0 不在候选范围）</td>
+        </tr>
+        <tr>
+          <td class="q">矛盾时的优先级</td>
+          <td>未定义</td>
+          <td><b>明确「Hard rules 区优先于摘要」</b></td>
+        </tr>
+        <tr>
+          <td class="q">模型是否知道自己缺了什么</td>
+          <td><span class="no">✗</span> 不知道缺，也就不会去搜</td>
+          <td><span class="yes">✓</span> 知道缺多少、缺在哪、怎么取</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2><span class="idx">3</span>成本核算</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th style="width:26%">改动</th><th style="width:13%">增量 token</th><th style="width:37%">实现难度</th><th style="width:24%">依据</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>完整性声明（3 行）</td><td class="num"><b>~55</b></td><td>极低：<code>shadowedSeqs</code> 已在事件里，多写一行</td><td>98 §4</td></tr>
+        <tr><td>裁剪声明（带规模 + 路径）</td><td class="num"><b>~40</b></td><td>低：<code>dsh-spill-policy</code> 已有完整实现，照抄格式</td><td>9B §3.6</td></tr>
+        <tr><td>Hard rules 区（3 条规则）</td><td class="num"><b>~120</b></td><td>中：需要一条「规则抽取 + 固定注入」链路</td><td>9C §4.1</td></tr>
+        <tr class="sum">
+          <td>合计</td>
+          <td class="num"><b>~215</b></td>
+          <td><span class="cell"><span class="txt">占工具 schema（12,139 tokens）的 <b>1.8%</b>；占系统提示（1,682）的 12.8%</span></span></td>
+          <td><span class="cell"><span class="txt">一次请求即为全部代价</span></span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2><span class="idx">4</span>两条推理路径（推演，未实测）</h2>
+  <div class="grid-3">
+    <div class="card card--warn">
+      <h3><span class="n">A</span>修改前：直接改代码</h3>
+      <pre class="code">读到摘要
+  → "TokenBudget::make(model_context_tokens, raw_ratio, summary_ratio)"
+  → 看到用户说 "50%"
+  → 判断：这是调整 raw_ratio 的值
+  → 直接改代码
+
+结果：违反了「所有上限必须让我明确批准才能加」</pre>
+      <p class="note">为什么没停下来问？<b>preamble 说得很清楚：</b>把摘要当「已确立的背景」（established background），
+        并且「不要提及这个检查点」（without acknowledging this checkpoint）。
+        系统实际上要求模型：把有损代理当权威原件，且不许质疑。</p>
+    </div>
+    <div class="card">
+      <h3><span class="n">B</span>修改后：先确认</h3>
+      <pre class="code">读到 Hard rules [R1]
+  → "任何数值上限的新增或调整，先问…得到同意才动手"
+  → 识别：用户说 "50%"，这是给 buffer 加上限
+  → 按 R1 必须确认：
+    「你说的 50% 是给哪个 buffer 设上限？
+     按你之前的要求（所有上限需明确批准），
+     我需要你确认：这算新增一个上限，还是调整已有的？」
+  → （可选）若用户说"我不记得说过"：
+     session_query(seq_from=41, seq_to=2184) 查原始记录</pre>
+      <p class="note">关键差别不在「记性更好」—— 摘要内容一字未变，被压缩的 2,143 条事件也不会回来。
+        差别在：这条规则不再是「某份背景里的一句话」，而是<b>一个永远在眼前、可核对、带明确优先级的约束</b>。</p>
+    </div>
+    <div class="card">
+      <h3><span class="n">§</span>三条原理依据</h3>
+      <p><b>一、指针优于告知。</b>MemGPT 的 70% 压力警告、Claude Code 的 Referenced file，都采用「指针」形式而非「你被裁了」的自我告知 —— 同样 token 预算，前者买到能力，后者只买到焦虑。所以写 <code>session_query(seq_from=41, …)</code>，而不是「你的上下文被压缩了，请小心」。</p>
+      <p style="margin-top:8px"><b>二、重注入是唯一扛得住压缩的原语。</b>Claude Code 的 <code>What survives compaction</code> 表证明：CLAUDE.md、auto memory、skill 描述全部从磁盘重新注入，而路径作用域规则会被摘要掉。</p>
+      <p style="margin-top:8px"><b>三、检索是 pull 模式，前提是「知道自己缺」。</b>即使打开 session_query，模型也不会主动去搜一个它不知道缺的东西 —— 所以指针必须<b>在上下文里</b>。</p>
+    </div>
+  </div>
+
+  <h2><span class="idx">5</span>必须诚实说明的局限</h2>
+  <div class="grid-3">
+    <div class="card card--warn">
+      <h3><span class="n">!</span>版本 B 不能防止模型无视 R1</h3>
+      <p>它只是让 R1 <b>在视野里、可核对、有优先级</b>。模型仍可能：判断错了（认为 50% 不是上限）、图省事跳过确认、被其他内容分散注意力。</p>
+      <p style="margin-top:8px"><b>改进的是「信息可得性」，不是「遵从度」。</b>与 9D 的结论一致：架构能保证「在场」，不能保证「遵守」。后者需要别的机制，例如把确认动作做成工具层的强制前置。</p>
+    </div>
+    <div class="card">
+      <h3><span class="n">!</span>地图还是残的，但不再迷路</h3>
+      <p><b>修改前：</b>给你一张地图，撕掉了 80%，不告诉你撕了哪儿，也不给你指南针。</p>
+      <p style="margin-top:8px"><b>修改后：</b>同一张残缺地图，但标注了「此处缺失 2,143 格，原图存放在 X，坐标从这里开始」，并在角落钉着三张「不可协商的便签」。</p>
+    </div>
+    <div class="card">
+      <h3><span class="n">+</span>最小可行改动：一行，约 25 tokens</h3>
+      <pre class="diff"><span class="ctx">  [compacted-summary] … [/compacted-summary]</span>
+<span class="add">
++ [compacted: 2,143 events · 479,142 tokens · seq 41–2184 · session_query 可取回]</span></pre>
+      <p class="note">它解决不了「硬规则优先级」，但能解决最要命的那一半：
+        让模型知道<b>自己正在读代理，以及代理的边界在哪</b>。</p>
+    </div>
+  </div>
+
+  <h2><span class="idx">6</span>诚实标注</h2>
+  <div class="honest">
+    <h2 style="color:var(--amber)">这份材料里，哪些是实测、哪些是重建、哪些是推演</h2>
+    <ul>
+      <li><span class="tag">实测</span><b>上下文结构、节点顺序、标记文本格式</b>来自源码常量与日志：node 0 是 <code>system/message</code> 且永不被遮蔽；
+        <code>CHECKPOINT_PREAMBLE</code> 原文；<code>&lt;compacted-summary&gt;</code> 开闭标签 17/17 存在；
+        <code>PRUNE_MARKER = "\n\n[... tool result middle pruned ...]\n\n"</code>。</li>
+      <li><span class="tag">实测</span><b>所有数字</b>来自 98 与 9B：压缩遮蔽 2,143 事件 / 479,142 tokens（seq 41–2184）；
+        59 次 prune，原文合计 1,166,597 字符，替换后典型长度 5,159 字符；系统提示 1,682 tokens；工具 schema 12,139 tokens。</li>
+      <li><span class="tag">重建</span><b>摘要正文是示意。</b>它是按摘要 prompt 要求的 8 个固定小节重建的，措辞非原文；
+        实测摘要模型每次输出 2,333–4,348 tokens，此处为节选式重建，用于让读者看见「一条硬规则在 12 条 bullet 中间」是什么手感。</li>
+      <li><span class="tag">推演</span><b>模型的行为反应未实测。</b>「A 直接改代码」「B 先确认」都是基于 preamble 措辞与规则形态的推演。
+        目前<b>没有任何对照实验</b>证明加上 R1 后遵从率会上升 —— <code>memory-survey</code> 也明确指出，
+        「结构化更抗压缩」是机制推理 + 间接证据。</li>
+      <li><span class="tag">已修正</span><b>口径混用已在本版修正。</b>此前示例把 <code>1,166,597</code>（59 次 prune 的原文<b>合计</b>）
+        与 <code>5,159</code>（<b>单条</b>替换后的固定长度 = head 4096 + 标记 35 + tail 1024）相减，得到一个不成立的 −99.6%。
+        现改为按<b>单条</b>口径表述：原文 18,006 → 裁后 5,159，省略 12,847，减幅 −71.3%；
+        合计层面则是 1,166,597 → 304,427（−73.9%）。两处比例接近并非巧合，但分母不同，不可混算。</li>
+      <li><span class="tag">局限</span>本方案只做「信息可得性」，不做「遵从度」；且它假设 <code>session_query</code> 类工具可用 ——
+        当前 web profile 里 <code>tool-session-query</code> <b>并未挂载</b>（全文搜索后端 <code>openAt: never</code>），
+        所以声明里的取回命令在今天是<b>无效指针</b>，需要与工具挂载一起做。</li>
+    </ul>
+  </div>
+
+  <h2><span class="idx">7</span>如果你要验证这个示例：实验设计建议</h2>
+  <div class="grid-3">
+    <div class="card">
+      <h3><span class="n">1</span>构造</h3>
+      <p>造一个含硬约束的长会话（&gt;阈值），让压缩<b>真实发生</b>。约束要写在很早的位置，且后续有多轮无关工作把它挤出视野。</p>
+    </div>
+    <div class="card">
+      <h3><span class="n">2</span>分组</h3>
+      <p><b>A 组</b>：用当前格式，问一个会触发该约束的请求，记录是否违反。<br>
+        <b>B 组</b>：加上 Hard rules 区 + 完整性声明，问完全相同的问题。</p>
+    </div>
+    <div class="card">
+      <h3><span class="n">3</span>计量</h3>
+      <p>每组跑 <b>10 次</b>，统计违反率；同时记录模型是否主动调用取回命令（这能验证「指针是否被用上」）。
+        再跑一个 B′ 组（只加 25 tokens 的单行声明），分离「量化」与「规则重注入」各自的贡献。</p>
+    </div>
+  </div>
+  <p class="note" style="margin-top:12px;max-width:96ch">
+    这个实验目前没人做过。所以本页的方案是<b>有原理支撑的假设，不是已验证的结论</b> ——
+    在拿数据之前，请把它当作「值得一试的最小改动」，而不是「已知有效的修复」。
+  </p>
+</section>
+
+<footer>
+  <div class="row">
+    <span>生成于 2026-11-13 · 单文件、零外部依赖（无 CDN / 无外链字体 / 无网络请求）</span>
+    <span>来源：
+      <a href="9F-full-context-comparison.md">9F 完整对比</a> ·
+      <a href="98-compaction-findings.md">98 压缩实测</a> ·
+      <a href="9B-dsh-source-findings.md">9B 源码解剖</a> ·
+      <a href="9E-example-before-after.md">9E 前后对照</a>
+    </span>
+  </div>
+</footer>
+
+<!-- 浮动提示载体 -->
+<div class="popover" id="popover" role="dialog" aria-live="polite" hidden>
+  <h4 id="popTitle"></h4>
+  <div class="where" id="popWhere"></div>
+  <p id="popBody"></p>
+  <div class="cost" id="popCost"></div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var body = document.body;
+  var paneLeft = document.getElementById("paneLeft");
+  var paneRight = document.getElementById("paneRight");
+  var onlyNew = document.getElementById("onlyNew");
+  var syncBox = document.getElementById("syncScroll");
+  var themeBtn = document.getElementById("themeBtn");
+  var expandBtn = document.getElementById("expandBtn");
+
+  /* ── 1. 同一节点左右对齐：把每对卡片的高度取齐 ─────────────── */
+  function isStacked() {
+    return window.matchMedia("(max-width: 900px)").matches;
+  }
+
+  function alignPairs() {
+    var pairs = {};
+    var i;
+    var nodes = document.querySelectorAll(".pane .node[data-pair]");
+    for (i = 0; i < nodes.length; i++) {
+      var key = nodes[i].getAttribute("data-pair");
+      if (!pairs[key]) { pairs[key] = []; }
+      pairs[key].push(nodes[i]);
+    }
+    Object.keys(pairs).forEach(function (key) {
+      var list = pairs[key];
+      var j;
+      for (j = 0; j < list.length; j++) { list[j].style.minHeight = ""; }
+    });
+    if (isStacked()) { return; }
+    // 读一次布局后再写，避免读写交错造成的抖动
+    var heights = {};
+    Object.keys(pairs).forEach(function (key) {
+      heights[key] = 0;
+      pairs[key].forEach(function (el) {
+        if (el.offsetHeight > heights[key]) { heights[key] = el.offsetHeight; }
+      });
+    });
+    Object.keys(pairs).forEach(function (key) {
+      var h = heights[key];
+      if (h > 0) {
+        pairs[key].forEach(function (el) { el.style.minHeight = h + "px"; });
+      }
+    });
+  }
+
+  var alignTimer = null;
+  function scheduleAlign() {
+    if (alignTimer) { window.clearTimeout(alignTimer); }
+    alignTimer = window.setTimeout(alignPairs, 60);
+  }
+
+  window.addEventListener("resize", scheduleAlign, { passive: true });
+  window.addEventListener("load", scheduleAlign);
+
+  var detailsList = document.querySelectorAll("details");
+  for (var d = 0; d < detailsList.length; d++) {
+    detailsList[d].addEventListener("toggle", scheduleAlign);
+  }
+
+  /* ── 2. 联动滚动（可关，关掉后两栏各自独立） ───────────────── */
+  var syncOn = true;
+  var syncing = false;
+
+  function ratioOf(pane) {
+    var max = pane.scrollHeight - pane.clientHeight;
+    return max > 0 ? pane.scrollTop / max : 0;
+  }
+
+  function link(a, b) {
+    a.addEventListener("scroll", function () {
+      if (!syncOn || syncing) { return; }
+      syncing = true;
+      var maxB = b.scrollHeight - b.clientHeight;
+      b.scrollTop = maxB > 0 ? ratioOf(a) * maxB : 0;
+      window.requestAnimationFrame(function () { syncing = false; });
+    }, { passive: true });
+  }
+  link(paneLeft, paneRight);
+  link(paneRight, paneLeft);
+
+  syncBox.addEventListener("change", function () {
+    syncOn = syncBox.checked;
+    if (syncOn) {
+      // 打开时先对齐一次当前位置，避免两栏错位继续放大
+      var maxR = paneRight.scrollHeight - paneRight.clientHeight;
+      paneRight.scrollTop = maxR > 0 ? ratioOf(paneLeft) * maxR : 0;
+    }
+  });
+
+  /* ── 3. 只看新增 ──────────────────────────────────────────── */
+  onlyNew.addEventListener("change", function () {
+    body.classList.toggle("focus-new", onlyNew.checked);
+  });
+
+  /* ── 4. 主题切换 ──────────────────────────────────────────── */
+  function setTheme(theme) {
+    document.documentElement.setAttribute("data-theme", theme);
+    themeBtn.textContent = theme === "dark" ? "切换到浅色" : "切换到深色";
+    try { window.localStorage.setItem("dsh9h-theme", theme); } catch (e) { /* file:// 下可能不可用，忽略 */ }
+  }
+  themeBtn.addEventListener("click", function () {
+    var next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    setTheme(next);
+  });
+  try {
+    var saved = window.localStorage.getItem("dsh9h-theme");
+    if (saved === "light" || saved === "dark") { setTheme(saved); }
+  } catch (e) { /* 忽略 */ }
+
+  /* ── 5. 展开 / 折叠全部摘要 ──────────────────────────────── */
+  var expanded = true;
+  expandBtn.addEventListener("click", function () {
+    expanded = !expanded;
+    var list = document.querySelectorAll(".node details");
+    for (var k = 0; k < list.length; k++) { list[k].open = expanded; }
+    expandBtn.textContent = expanded ? "折叠全部摘要" : "展开全部摘要";
+    scheduleAlign();
+  });
+
+  /* ── 6. 增量标签 → 浮动说明 ──────────────────────────────── */
+  var TIPS = {
+    hardrules: {
+      title: "Hard rules 固定段",
+      where: "node 0 · system/message · 永不被压缩",
+      body: "把「跨压缩必须存活」的规则从可压信道（摘要正文）搬到 node 0。node 0 是唯一永不被遮蔽的节点（selectCompactableRange 从第 1 号节点起才算候选），所以这里的规则不会随每次再压缩衰减。内容不是新规则：全部是用户原话逐字引用，只加了可执行化、seq 溯源、撤销状态与优先级声明。",
+      cost: "增量 ~120 tokens｜实现难度：中（需「规则抽取 + 固定注入」链路）｜依据：9C §4.1"
+    },
+    integrity: {
+      title: "完整性声明（3 行）",
+      where: "node 1 · 检查点末尾",
+      body: "量化（2,143 条 / 479,142 tokens）、可操作（seq 区间 + 取回命令）、优先级（与 Hard rules 冲突时以那边为准）。三个字段 shadowedSeqs / shadowedTokenCount / shadowedRange 已经躺在 compaction/summary 事件里，只是从不进入 surface，所以实现成本极低。",
+      cost: "增量 ~55 tokens｜实现难度：极低｜依据：98 §4"
+    },
+    prune: {
+      title: "裁剪声明（带规模 + 路径）",
+      where: "node 2 ~ n · tool/result 中段",
+      body: "把只有「[... tool result middle pruned ...]」的无规模标记，换成带字符数、压缩比、spill 路径与取回命令的声明。dsh-spill-policy 已经会输出等价的一句话（read with offset/limit, or grep this path），pruner 照抄格式即可闭环。",
+      cost: "增量 ~40 tokens｜实现难度：低｜依据：9B §3.6"
+    },
+    total: {
+      title: "合计增量",
+      where: "一次请求即为全部代价",
+      body: "三处改动合计约 215 tokens，约等于工具 schema（12,139 tokens）的 1.8%、系统提示（1,682 tokens）的 12.8%。这些 token 每一步请求都会重新计入，所以它是一次性设计成本、持续性运行成本 —— 与它换来的「不会在没察觉的情况下违反一条被明确说过的约束」相比仍然极低。",
+      cost: "55 + 40 + 120 ≈ 215 tokens（1.8% of 12,139）"
+    }
+  };
+
+  var pop = document.getElementById("popover");
+  var popTitle = document.getElementById("popTitle");
+  var popWhere = document.getElementById("popWhere");
+  var popBody = document.getElementById("popBody");
+  var popCost = document.getElementById("popCost");
+  var activeBadge = null;
+
+  function placePopover(target) {
+    var r = target.getBoundingClientRect();
+    pop.hidden = false;
+    pop.style.visibility = "hidden";
+    pop.style.left = "0px";
+    pop.style.top = "0px";
+    var w = pop.offsetWidth;
+    var h = pop.offsetHeight;
+    var left = r.left + w > window.innerWidth - 12 ? window.innerWidth - w - 12 : Math.max(12, r.left);
+    var top = r.bottom + 8;
+    if (top + h > window.innerHeight - 12) { top = Math.max(12, r.top - h - 8); }
+    pop.style.left = left + "px";
+    pop.style.top = top + "px";
+    pop.style.visibility = "visible";
+  }
+
+  function showTip(badge) {
+    var tip = TIPS[badge.getAttribute("data-tip")];
+    if (!tip) { return; }
+    popTitle.textContent = tip.title;
+    popWhere.textContent = tip.where;
+    popBody.textContent = tip.body;
+    popCost.textContent = tip.cost;
+    activeBadge = badge;
+    placePopover(badge);
+  }
+
+  function hideTip() {
+    pop.hidden = true;
+    activeBadge = null;
+  }
+
+  document.addEventListener("click", function (event) {
+    var badge = event.target.closest ? event.target.closest(".badge") : null;
+    if (badge) {
+      event.preventDefault();
+      if (activeBadge === badge) { hideTip(); return; }
+      showTip(badge);
+      return;
+    }
+    if (!pop.hidden && !pop.contains(event.target)) { hideTip(); }
+  });
+
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && !pop.hidden) { hideTip(); }
+  });
+
+  window.addEventListener("scroll", function () {
+    if (!pop.hidden && activeBadge) { placePopover(activeBadge); }
+  }, { passive: true });
+
+  window.addEventListener("resize", function () {
+    if (!pop.hidden && activeBadge) { placePopover(activeBadge); }
+  }, { passive: true });
+
+  /* ── 7. 首次渲染后对齐一次 ──────────────────────────────── */
+  requestAnimationFrame(function () {
+    alignPairs();
+    requestAnimationFrame(alignPairs);
+  });
+  window.setTimeout(alignPairs, 400);
+})();
+</script>
+</body>
+</html>

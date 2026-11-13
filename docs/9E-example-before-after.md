@@ -2,6 +2,9 @@
 
 > 用真实会话数据构造的对照示例。
 > 所有数字（`479,142` / `2,143` / `5,159` / `12,847`）来自 [98-compaction-findings.md](98-compaction-findings.md) 的实测，
+> **注意口径**：`1,166,597` 是 59 次 prune 的原文**合计**，`5,159` 是**单条**替换后的固定长度
+> （head 4096 + 标记 35 + tail 1024）。两者不能相减。示例中单条的原文取 18,006 字符，
+> 故省略 12,847、减幅 71.3%——与合计层面的 1,166,597 → 304,427（同为 −73.9%）口径一致。
 > 标记文本格式来自 [9B-dsh-source-findings.md](9B-dsh-source-findings.md) 引用的源码常量。
 >
 > 场景取自本机真实会话 `session-9ecf69ac`（super-feiyu 项目，C++ 模块化重写）。
@@ -154,7 +157,7 @@ the messages that follow, without acknowledging this checkpoint.
 ```
 <前 4096 字符>
 
-[pruned: 12,847 chars omitted (1,166,597 → 5,159, -99.6%)
+[pruned: 12,847 chars omitted (18,006 → 5,159, -71.3%)
  · full result spilled to:
    /…/session-9ecf…/…-tool-result-7731.txt
  · recover: read(path, offset=4096) or grep(path, pattern)]
