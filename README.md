@@ -49,6 +49,7 @@
 | [docs/9C-memory-survey.md](docs/9C-memory-survey.md) | **业界记忆系统对照**：16 个系统、六种范式、可迁移原理（区分论文/官方/第三方） |
 | [docs/9D-memory-architecture-review.md](docs/9D-memory-architecture-review.md) | **记忆架构评审**：现状 → 不合理 → 问题 → 解法，四段式总结 |
 | [docs/9E-example-before-after.md](docs/9E-example-before-after.md) | **修改前后对照示例**：真实会话里，模型实际收到的上下文长什么样 |
+| [docs/9F-full-context-comparison.md](docs/9F-full-context-comparison.md) | **完整上下文对比**：同一问题的两个版本，逐节点展开模型收到的全部消息 |
 
 **主干**：`40` → `50` → `52` → `55`。`60`/`70`/`80` 是横向约束。
 
