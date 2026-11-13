@@ -50,6 +50,8 @@
 | [docs/9D-memory-architecture-review.md](docs/9D-memory-architecture-review.md) | **记忆架构评审**：现状 → 不合理 → 问题 → 解法，四段式总结 |
 | [docs/9E-example-before-after.md](docs/9E-example-before-after.md) | **修改前后对照示例**：真实会话里，模型实际收到的上下文长什么样 |
 | [docs/9F-full-context-comparison.md](docs/9F-full-context-comparison.md) | **完整上下文对比**：同一问题的两个版本，逐节点展开模型收到的全部消息 |
+| [docs/9G-memory-solution.md](docs/9G-memory-solution.md) | **记忆架构完整方案**：四专题（上下文传输/压缩/记忆检索/缓存命中）+ 接口 + 验收 | 
+| [docs/9H-context-comparison.html](docs/9H-context-comparison.html) | **可视化对比页**：左右并排，单文件零依赖，浏览器直接打开 |
 
 **主干**：`40` → `50` → `52` → `55`。`60`/`70`/`80` 是横向约束。
 
