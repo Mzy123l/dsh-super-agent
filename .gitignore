@@ -29,3 +29,7 @@ credentials.json
 Thumbs.db
 .idea/
 .vscode/
+
+# 临时探查脚本
+tmp/
+
