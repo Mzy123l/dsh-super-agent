@@ -41,6 +41,8 @@
 | [docs/70-security.md](docs/70-security.md) | **安全边界**：九个威胁、明确接受的风险、优先级排序 |
 | [docs/80-others.md](docs/80-others.md) | **其他方面**：防糊弄落地、配置分层、可观测性、升级兼容、测试策略、**什么时候该砍掉这套东西** |
 | [docs/95-open-questions.md](docs/95-open-questions.md) | **开放问题登记表**：28 条待决 + 9 条技术未解 + 已接受的风险，唯一权威清单 |
+| [docs/96-history-digest.md](docs/96-history-digest.md) | **本机 243 个会话的全量摘要**：规模、长期偏好、纠正模式归因、可粘贴的 AGENTS.md 规则 |
+| [docs/97-memory-analysis.md](docs/97-memory-analysis.md) | **记忆问题分析与解法**：为什么忘了、怎么解，含一次判断修正记录 |
 
 **主干**：`40` → `50` → `52` → `55`。`60`/`70`/`80` 是横向约束。
 
