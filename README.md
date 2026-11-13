@@ -45,6 +45,9 @@
 | [docs/97-memory-analysis.md](docs/97-memory-analysis.md) | **单会话上下文记忆分析**：静默压缩/裁剪的实测、三次自我误判的留档 |
 | [docs/98-compaction-findings.md](docs/98-compaction-findings.md) | **压缩触发机制实测**：20 次压缩的真实成因、阈值陷阱、遮蔽量 |
 | [docs/9A-self-audit.md](docs/9A-self-audit.md) | **自我报告 vs 会话日志审计**：主代理自述 79% 准确，数字对、归属错 |
+| [docs/9B-dsh-source-findings.md](docs/9B-dsh-source-findings.md) | **dsh 上下文装配解剖**：一次请求的拼装全流程、五种注入源、12 条结构性缺陷 |
+| [docs/9C-memory-survey.md](docs/9C-memory-survey.md) | **业界记忆系统对照**：16 个系统、六种范式、可迁移原理（区分论文/官方/第三方） |
+| [docs/9D-memory-architecture-review.md](docs/9D-memory-architecture-review.md) | **记忆架构评审**：现状 → 不合理 → 问题 → 解法，四段式总结 |
 
 **主干**：`40` → `50` → `52` → `55`。`60`/`70`/`80` 是横向约束。
 
