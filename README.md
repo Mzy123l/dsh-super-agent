@@ -22,7 +22,8 @@
 
 ## 目录
 
-> **新读者从 [docs/90-start-here.md](docs/90-start-here.md) 开始**——那是一页导航，说明产出、待决定项与风险。
+> **新读者从 [docs/90-start-here.md](docs/90-start-here.md) 开始**——架构设计入口。
+> **记忆问题这一条线从 [docs/9J-memory-summary.md](docs/9J-memory-summary.md) 开始**——含"方案被自己的实验证伪"的结论。
 
 文档按编号读；第二部分（40 之后）是对原始十个问题的讨论结论，与第一部分并行、互不依赖。
 
@@ -52,6 +53,8 @@
 | [docs/9F-full-context-comparison.md](docs/9F-full-context-comparison.md) | **完整上下文对比**：同一问题的两个版本，逐节点展开模型收到的全部消息 |
 | [docs/9G-memory-solution.md](docs/9G-memory-solution.md) | **记忆架构完整方案**：四专题（上下文传输/压缩/记忆检索/缓存命中）+ 接口 + 验收 | 
 | [docs/9H-context-comparison.html](docs/9H-context-comparison.html) | **可视化对比页**：左右并排，单文件零依赖，浏览器直接打开 |
+| [docs/9I-ab-experiment.md](docs/9I-ab-experiment.md) | **A/B 对照实验**：40 次真实运行，硬规则重注入**未改变行为** |
+| [docs/9J-memory-summary.md](docs/9J-memory-summary.md) | **记忆线总览**：产出清单、结论分层、方案修正方向、待决事项 |
 
 **主干**：`40` → `50` → `52` → `55`。`60`/`70`/`80` 是横向约束。
 
