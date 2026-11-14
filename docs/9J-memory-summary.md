@@ -35,6 +35,9 @@
 | 文件 | 一句话 |
 | --- | --- |
 | [9I-ab-experiment.md](9I-ab-experiment.md) | **A/B 对照实验：40 次真实运行，方案被证伪一半** |
+| [9P-memory-gradient-lit.md](9P-memory-gradient-lit.md) | **文献调研**：「近全量+远总结」有强先例；回填要做一等公民 |
+| [9O-memory-plugin-spec.md](9O-memory-plugin-spec.md) | **插件规格**：四条用户决策 + 9 条验收 |
+| **`memory-plugin/`** | **理论实现**：全量索引（含 shadowed）+ FTS5 + 注入式向量；52 测试全绿、覆盖率 97.1% |
 
 ---
 
