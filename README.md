@@ -56,6 +56,9 @@
 | [docs/9I-ab-experiment.md](docs/9I-ab-experiment.md) | **A/B 对照实验**：40 次真实运行，硬规则重注入**未改变行为** |
 | [docs/9J-memory-summary.md](docs/9J-memory-summary.md) | **记忆线总览**：产出清单、结论分层、方案修正方向、待决事项 |
 | [docs/9L-tool-call-summary-design.md](docs/9L-tool-call-summary-design.md) | **工具调用概要化设计**：默认概要 + 可展开，对治"未压缩也不记得自己干过什么" |
+| [docs/9M-reasoning-in-context.md](docs/9M-reasoning-in-context.md) | **思考内容实测**：reasoning 逐字回传、无开关；与工具结果同待遇 |
+| [docs/9N-cross-time-recall.md](docs/9N-cross-time-recall.md) | **跨时间召回**：「早说的待办」三段链路解剖与三层解法（部分决策已修订，以 9O 为准） |
+| [docs/9O-memory-plugin-spec.md](docs/9O-memory-plugin-spec.md) | **记忆插件规格**：自建存储 + 全量搜索 + 思考只向量化，纯理论实现 |
 
 **主干**：`40` → `50` → `52` → `55`。`60`/`70`/`80` 是横向约束。
 
