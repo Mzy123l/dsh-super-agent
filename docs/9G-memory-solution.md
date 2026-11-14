@@ -605,7 +605,7 @@ export interface InjectionGate {
 |---|---|---|---|---|
 | **S1** | checkpoint 加 `[compaction-declaration]`（§3.2.2） | 无 | **最高性价比**：`shadowedSeqs` 已在事件里，只多写几十行文本 | B1、B2 |
 | **S2** | prune 标记补规模与路径（9D §4.1 方案 A 下半句） | 无 | 与 S1 同源，同样便宜 | 标记含字符数 + 可执行路径 |
-| **S2.5** | **工具结果概要化**（[9L](9L-tool-call-summary-design.md)）：`post-execute` 挂点，阈值 2,000 字符，规则式概要 + spill 落盘 | 无 | **用户已确认成本可接受**。历史体积降 ≥60%；取代 prune；"我之前干了什么"变得可扫读 | 9L §6 全部 6 条 |
+| **S2.5** | **工具结果概要化**（[9L](9L-tool-call-summary-design.md)）：`post-execute` 挂点，阈值 2,000 字符。**两层**：定位层（规则式，零调用）现在做；压缩层（小模型 gist，用户已确认成本可接受）待一期验证后做 | 无 | **用户已确认成本可接受**。历史体积降 ≥60%；取代 prune；"我之前干了什么"变得可扫读 | 9L §6 全部 7 条（新增 gist 质量抽检 ≥80% 与不阻塞主会话） |
 | **S3** | 挂 `session_event_read`，打开 `session-query-sqlite`（§4.3.3） | 无 | 让 S1/S2 的指针**真的能执行** | C6、C7 |
 | **S4** | 换摘要 prompt（§3.2.4） | 无 | 独立收益，可与 S1-S3 并行 | B4（须 A/B 实证） |
 | **S5** | `DecisionRecord` + 压缩前钩子（§3.2.3、§4.3.1） | S1 | 决策层开始积累 | B3、C1-C3 |
