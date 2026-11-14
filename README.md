@@ -55,6 +55,7 @@
 | [docs/9H-context-comparison.html](docs/9H-context-comparison.html) | **可视化对比页**：左右并排，单文件零依赖，浏览器直接打开 |
 | [docs/9I-ab-experiment.md](docs/9I-ab-experiment.md) | **A/B 对照实验**：40 次真实运行，硬规则重注入**未改变行为** |
 | [docs/9J-memory-summary.md](docs/9J-memory-summary.md) | **记忆线总览**：产出清单、结论分层、方案修正方向、待决事项 |
+| [docs/9L-tool-call-summary-design.md](docs/9L-tool-call-summary-design.md) | **工具调用概要化设计**：默认概要 + 可展开，对治"未压缩也不记得自己干过什么" |
 
 **主干**：`40` → `50` → `52` → `55`。`60`/`70`/`80` 是横向约束。
 
