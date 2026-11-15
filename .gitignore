@@ -48,3 +48,6 @@ captures/
 # 工具夹具与压测大文件
 tools/.tmp/
 
+
+# 临时文件
+.tmp-*
