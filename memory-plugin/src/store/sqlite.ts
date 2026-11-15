@@ -85,6 +85,16 @@ export class MemoryStore {
     this.db.close()
   }
 
+  /**
+   * 暴露底层 SQLite 连接，供同库的其它表（如封存段）复用同一连接。
+   *
+   * 共享连接而不是另开一个：SQLite 的 WAL 模式下多连接写会互相阻塞，
+   * 且封存与索引本就属于同一个插件的状态。
+   */
+  get raw(): ReturnType<typeof DatabaseConstructor> {
+    return this.db
+  }
+
   /** 单条写入记录 + FTS（事务外由调用方包批） */
   insertRecord(record: MemoryRecord, shadowed: boolean): void {
     this.insertRecordStmt.run(

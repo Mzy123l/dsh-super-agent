@@ -17,6 +17,9 @@ import { discoverSessionFiles, indexAll, indexSession, type IndexReport } from '
 import { search } from './search/index.js'
 import { NoopVectorStore } from './search/vector.js'
 import type { IndexerConfig, SearchMode } from './types.js'
+import { SealStore } from './seal/store.js'
+import { createSealTool } from './seal/tool.js'
+import { applySeal } from './seal/apply.js'
 
 /** Cordis 插件名。 */
 export const name = 'memory-plugin'
@@ -37,18 +40,23 @@ export interface Config {
   dataDir: string
   /** 检索返回的最大条数。 */
   maxResults?: number
+  /** 「近几步」保留原文的轮次数；更早的才允许封存。 */
+  keepTurns?: number
 }
 
 const DEFAULT_MAX_RESULTS = 8
+const DEFAULT_KEEP_TURNS = 3
 
 /** 从环境变量读配置（不触碰 ctx.config，避免 inject 依赖）。 */
 function resolveConfig(): Config {
   const home = process.env.DSH_HOME ?? `${process.env.HOME ?? '.'}/.dsh`
   const max = Number(process.env.MEMORY_MAX_RESULTS ?? DEFAULT_MAX_RESULTS)
+  const keep = Number(process.env.MEMORY_KEEP_TURNS ?? DEFAULT_KEEP_TURNS)
   return {
     sessionsDir: process.env.MEMORY_SESSIONS_DIR ?? `${home}/sessions`,
     dataDir: process.env.MEMORY_DATA_DIR ?? './data',
     maxResults: Number.isFinite(max) && max > 0 ? max : DEFAULT_MAX_RESULTS,
+    keepTurns: Number.isFinite(keep) && keep >= 0 ? keep : DEFAULT_KEEP_TURNS,
   }
 }
 
@@ -68,6 +76,32 @@ export function apply(ctx: Context): void {
     dataDir: config.dataDir,
     vectorStore,
   }
+
+  // ---- L2 层：封存（近几步全量 + 总结，再前面的只有总结）----
+  // 复用同一个 SQLite 连接：封存段与检索记录同库不同表。
+  const sealStore = new SealStore(store.raw)
+
+  /** 各会话的最新轮次（由 session/event 维护）。 */
+  const latestTurns = new Map<string, number>()
+
+  ctx.on('session/event', (session, event) => {
+    if (event.type !== 'turn/start') return
+    const sid = (session as unknown as { id?: string }).id
+    const turn = (event as unknown as { data?: { turn?: number } }).data?.turn
+    if (typeof sid === 'string' && typeof turn === 'number') {
+      latestTurns.set(sid, Math.max(latestTurns.get(sid) ?? 0, turn))
+    }
+  }, { global: true })
+
+  ctx.tools.register(createSealTool({
+    store: sealStore,
+    latestTurn: (sessionId) => latestTurns.get(sessionId) ?? 0,
+    keepTurns: config.keepTurns ?? DEFAULT_KEEP_TURNS,
+    appendToSession: (sessionId, segment) => {
+      applySeal(ctx, segment as Parameters<typeof applySeal>[1])
+    },
+    warn: (message) => ctx.logger.warn('memory-plugin: %s', message),
+  }, ctx))
 
   /** 空的索引报告（增量索引时复用同一个 report 累加）。 */
   const emptyReport = (): IndexReport => ({
