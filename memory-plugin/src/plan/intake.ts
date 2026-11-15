@@ -80,9 +80,37 @@ export function buildIntakePrompt(): string {
 }
 
 /**
+ * 时间单位（分钟）的匹配片段。
+ *
+ * 只认"分钟/小时"这类明确单位，避免把"改了 3 个文件"里的 3 当成分钟。
+ */
+const MINUTE_UNIT = '(?:分钟|分鐘|mins?|minutes?|m(?![a-z]))'
+const HOUR_UNIT = '(?:小时|小時|hours?|hrs?|h(?![a-z]))'
+const NUM = '(\\d+(?:\\.\\d+)?)'
+
+/**
+ * 带单位的时间表述。
+ *
+ * 覆盖："5 分钟"、"约 5 分钟"、"5 to 10 minutes"、"half an hour"、
+ * "1 小时"、"1.5h"、"5-10 分钟"（取上界）。
+ */
+const TIME_EXPRESSION = new RegExp(
+  `(?:${NUM}\\s*(?:${MINUTE_UNIT}|${HOUR_UNIT}))`
+  + `|(?:${NUM}\\s*(?:到|至|-|~|～|to)\\s*${NUM}\\s*${MINUTE_UNIT})`
+  + `|(?:半\\s*个?\\s*小时|half\\s+an?\\s+hour)`,
+  'i',
+)
+
+/**
  * 从模型回复里解析分钟数。
  *
- * 容错：允许 "5"、"约 5 分钟"、"5 minutes"、"about 5 min" 这类形态。
+ * 容错优先，按「信息明确度」从高到低尝试：
+ *   1. 带单位的耗时表述（"约 5 分钟"、"5 to 10 minutes"、"1 小时"）——最可信
+ *   2. 区间表述取**上界**（"5 到 10 分钟" → 10）——宁可多规划，不可漏规划
+ *   3. 整条回复就是裸数字（"5"）——问句要求的形态
+ *   4. 都不匹配时返回 undefined（调用方据此重问）
+ *
+ * 注意：不在长文本里盲取第一个数字。那会把"改了 3 个文件"读成 3 分钟。
  *
  * @param reply - 模型回复原文。
  * @returns 分钟数；无法解析时 undefined。
@@ -90,21 +118,53 @@ export function buildIntakePrompt(): string {
 export function parseEstimate(reply: string): number | undefined {
   const t = reply.trim()
   if (t.length === 0) return undefined
-  // 取第一个出现的数字
-  const m = t.match(/\d+(?:\.\d+)?/)
-  if (m === null) return undefined
-  const n = Number(m[0])
-  return Number.isFinite(n) && n >= 0 ? n : undefined
+
+  // 1) 半/整小时的特殊表述
+  if (/(?:半\s*个?\s*小时|half\s+an?\s+hour)/i.test(t)) return 30
+
+  // 2) 带单位的区间：取上界（偏向多规划）
+  const range = new RegExp(
+    `${NUM}\\s*(?:到|至|-|~|～|to)\\s*${NUM}\\s*${MINUTE_UNIT}`, 'i',
+  ).exec(t)
+  if (range !== null) {
+    const hi = Number(range[2])
+    if (Number.isFinite(hi) && hi >= 0) return hi
+  }
+
+  // 3) 数字 + 单位。小时先试，否则 "1 小时" 会被分钟分支吃掉。
+  const hours = new RegExp(`${NUM}\\s*${HOUR_UNIT}`, 'i').exec(t)
+  if (hours !== null) {
+    const n = Number(hours[1])
+    if (Number.isFinite(n) && n >= 0) return Math.round(n * 60)
+  }
+  const minutes = new RegExp(`${NUM}\\s*${MINUTE_UNIT}`, 'i').exec(t)
+  if (minutes !== null) {
+    const n = Number(minutes[1])
+    if (Number.isFinite(n) && n >= 0) return Math.round(n)
+  }
+
+  // 4) 整条回复就是裸数字（允许少量装饰文字）
+  const bare = /^\s*(?:约|大概|大约|about|roughly|around|~)?\s*(\d+(?:\.\d+)?)\s*(?:分钟|分鐘|minutes?|mins?|m)?\s*$/i.exec(t)
+  if (bare !== null) {
+    const n = Number(bare[1])
+    return Number.isFinite(n) && n >= 0 ? Math.round(n) : undefined
+  }
+
+  return undefined
 }
 
-/** 判断回复是否像"在认真报时间"（而不是又开始长篇大论）。 */
+/**
+ * 判断回复是否像"在认真报时间"。
+ *
+ * 与 parseEstimate 保持同一套判定：**只要能被解析出耗时就算像**，
+ * 不再要求"回复很短"。模型可能会说
+ * "大概需要 5 到 10 分钟，因为要改三个文件"——那是有效回答，
+ * 不该被判为答非所问而重问。
+ *
+ * @param reply - 模型回复原文。
+ */
 export function looksLikeEstimate(reply: string): boolean {
-  const t = reply.trim()
-  if (t.length === 0) return false
-  // 短回复且含数字，认为有效
-  if (t.length <= 40 && /\d/.test(t)) return true
-  // 长回复里只有数字也算（模型可能带一个单位词）
-  return /^\s*(?:约|about|roughly|around)?\s*\d+(?:\.\d+)?\s*(?:分钟|minutes?|mins?|m)?\s*$/i.test(t)
+  return parseEstimate(reply) !== undefined
 }
 
 /** 准入决策所需的宿主能力。 */

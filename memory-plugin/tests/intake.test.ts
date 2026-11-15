@@ -48,27 +48,43 @@ describe('问句与时间解析', () => {
   it('解析纯数字', () => {
     expect(parseEstimate('5')).toBe(5)
     expect(parseEstimate('  12  ')).toBe(12)
+    expect(parseEstimate('0')).toBe(0)
   })
 
   it('解析带单位的回复', () => {
     expect(parseEstimate('约 8 分钟')).toBe(8)
     expect(parseEstimate('about 30 min')).toBe(30)
     expect(parseEstimate('2 minutes')).toBe(2)
+    expect(parseEstimate('需要 20 分钟左右')).toBe(20)
   })
 
-  it('解析 0', () => {
-    expect(parseEstimate('0')).toBe(0)
+  it('小时换算成分钟', () => {
+    expect(parseEstimate('我估计要 1 小时')).toBe(60)
+    expect(parseEstimate('需要 2 小时')).toBe(120)
+    expect(parseEstimate('1.5h')).toBe(90)
+    expect(parseEstimate('half an hour')).toBe(30)
+  })
+
+  it('区间取上界（宁可多规划）', () => {
+    expect(parseEstimate('大概需要 5 到 10 分钟，因为要改三个文件')).toBe(10)
+    expect(parseEstimate('5 to 10 minutes')).toBe(10)
+  })
+
+  it('不把无单位的数字当成分钟', () => {
+    expect(parseEstimate('这个任务改了 3 个文件，共 200 行')).toBeUndefined()
   })
 
   it('无法解析时返回 undefined', () => {
     expect(parseEstimate('不知道')).toBeUndefined()
     expect(parseEstimate('')).toBeUndefined()
+    expect(parseEstimate('好的，我先看看你的代码，这是一段很长的分析文字')).toBeUndefined()
   })
 
-  it('looksLikeEstimate 识别短数字回复', () => {
+  it('looksLikeEstimate 与解析保持一致：能解析出时间就算像', () => {
     expect(looksLikeEstimate('5')).toBe(true)
     expect(looksLikeEstimate('约 5 分钟')).toBe(true)
-    expect(looksLikeEstimate('这是一段很长的解释，远超四十个字符长度限制的回复内容')).toBe(false)
+    expect(looksLikeEstimate('大概需要 5 到 10 分钟，因为要改三个文件')).toBe(true)
+    expect(looksLikeEstimate('这是一段很长的解释，完全不像在报时间的一句很长的回复')).toBe(false)
   })
 })
 
