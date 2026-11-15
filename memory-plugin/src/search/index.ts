@@ -65,10 +65,15 @@ export async function search(
   if (mode === 'hybrid' && ctx.vectorStore && ctx.embedding) {
     try {
       const emb = await ctx.embedding.embed(q)
-      const vecHits = await ctx.vectorStore.search(emb, Math.max(limit * 3, 20))
+      // 取更大候选集：向量表全库共享，按会话过滤后可能所剩无几。
+      // 若只取 limit*3，别的会话占满名额会让本会话一条都拿不到。
+      const vecHits = await ctx.vectorStore.search(emb, Math.max(limit * 10, 100))
       vecHits.forEach((vh, i) => {
         const parsed = parseVectorId(vh.id)
         if (!parsed) return
+        // 向量表是全库共享的（message_vector 只按 row_id 存），
+        // 所以必须在这里按会话过滤，否则会串到别的会话的数据。
+        if (options.sessionId !== undefined && parsed.sessionId !== options.sessionId) return
         const unit = ctx.store.getUnit(parsed.sessionId, parsed.idx)
         if (!unit) return
         const key = `${unit.sessionId}#${unit.idx}`

@@ -22,6 +22,7 @@ import type { SeqReader } from './projection/seqmap.js'
 import type { SurfaceWriter } from './projection/executor.js'
 import { search } from './search/index.js'
 import { SqliteVectorStore, HashingEmbedding } from './search/vector.js'
+import { syncVectors, forgetVectors } from './search/sync.js'
 import { vectorId } from './search/index.js'
 import type { ContextMessage, Unit, UnitResult } from './types.js'
 
@@ -96,6 +97,8 @@ export interface Config {
   autoSummary: boolean
   /** 是否启用规划准入（先问耗时再决定建不建规划） */
   autoPlan: boolean
+  /** 是否启用后台向量索引（关掉则混合检索退化为纯关键词） */
+  autoVector: boolean
 }
 
 function resolveConfig(): Config {
@@ -110,6 +113,7 @@ function resolveConfig(): Config {
     threshold: num(process.env.MEMORY_SUMMARY_THRESHOLD, SUMMARY_THRESHOLD),
     autoSummary: process.env.MEMORY_AUTO_SUMMARY !== '0',
     autoPlan: process.env.MEMORY_AUTO_PLAN !== '0',
+    autoVector: process.env.MEMORY_AUTO_VECTOR !== '0',
   }
 }
 
@@ -146,6 +150,41 @@ export function apply(ctx: Context): void {
   /** 被暂扣的用户消息（等时间评估期间不还给模型） */
   const heldMessages = new Map<string, UserMessage>()
 
+  /** 已算过向量的单位指纹（`<sid>#<idx>` → 指纹），避免重复计算嵌入 */
+  const vectorSeen = new Map<string, string>()
+
+  /** 各会话的向量同步是否已在跑：同一会话不并发，避免重复计算 */
+  const vectorBusy = new Set<string>()
+
+  /**
+   * 后台触发一次向量同步。
+   *
+   * **不能在热路径上 await**：`llm/stream` 是每次模型请求都会经过的地方，
+   * 让嵌入计算阻塞它会让响应变慢。所以丢到后台跑，失败只记日志。
+   *
+   * 同一会话已在同步时直接跳过（下一轮同步会补上，指纹机制保证不漏）。
+   */
+  const scheduleVectorSync = (sessionId: string): void => {
+    if (!config.autoVector) return
+    if (vectorBusy.has(sessionId)) return
+    vectorBusy.add(sessionId)
+    void (async () => {
+      try {
+        const report = await syncVectors(store, vectorStore, embedding, sessionId, vectorSeen)
+        if (report.failed > 0) {
+          ctx.logger.warn(
+            'memory-plugin: vector sync partial failure (%d/%d)',
+            report.failed, report.scanned,
+          )
+        }
+      } catch (error) {
+        ctx.logger.warn('memory-plugin: vector sync failed: %s', String(error))
+      } finally {
+        vectorBusy.delete(sessionId)
+      }
+    })()
+  }
+
   /** 各会话最近一条 assistant 可见文本与时刻（供收割）。 */
   const lastAssistant = new Map<string, { text: string; at: string }>()
 
@@ -170,6 +209,7 @@ export function apply(ctx: Context): void {
           (t) => pending.isConsumedReply(sid, t),
           pending.get(sid) !== undefined,
         )
+        scheduleVectorSync(sid)
       }
     } catch (error) {
       ctx.logger.warn('memory-plugin: sync failed: %s', String(error))
@@ -356,6 +396,7 @@ export function apply(ctx: Context): void {
     parameters: {
       query: { type: 'string', description: 'Text to search for. Keywords work best.' },
       limit: { type: 'number', description: 'Maximum results (default 8).' },
+      mode: { type: 'string', description: 'keyword | hybrid (default hybrid: keyword plus semantic).' },
       session: { type: 'string', description: 'Limit to one session id. Omit to search the current session.' },
     },
     output: {
@@ -384,12 +425,20 @@ export function apply(ctx: Context): void {
       },
       render: (_a: unknown, v: unknown) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    async execute(args: { query?: string; limit?: number; session?: string }, exec: { agent?: { session?: { id?: string } } }) {
+    async execute(args: { query?: string; limit?: number; mode?: string; session?: string }, exec: { agent?: { session?: { id?: string } } }) {
       const sessionId = args.session ?? exec.agent?.session?.id
+      // 默认走 hybrid：关键词 + 向量两路合并。
+      // 向量路能找回"字面不同但意思相近"的单位，尤其是窗口外的思考内容
+      // ——那些刻意不进关键词索引的东西，正需要这条通道。
+      // 向量表为空时 hybrid 自然退化为纯关键词，不会有副作用。
       const hits = await search(
         { store, vectorStore, embedding },
         String(args.query ?? ''),
-        { limit: typeof args.limit === 'number' ? args.limit : config.maxResults, sessionId },
+        {
+          mode: args.mode === 'keyword' ? 'keyword' : 'hybrid',
+          limit: typeof args.limit === 'number' ? args.limit : config.maxResults,
+          sessionId,
+        },
       )
       return {
         results: hits.map(h => ({
@@ -481,6 +530,7 @@ export function apply(ctx: Context): void {
       action: { type: 'string', description: 'list | add | done | drop | reopen' },
       title: { type: 'string', description: 'For add: one-line what to do later.' },
       detail: { type: 'string', description: 'For add: why, constraints, acceptance criteria.' },
+      from_idx: { type: 'number', description: 'For add: the unit index this todo came from. Omit for the latest unit.' },
       no: { type: 'number', description: 'For done/drop/reopen: the todo number.' },
       reason: { type: 'string', description: 'For drop: why it is abandoned.' },
       all: { type: 'boolean', description: 'For list: include done and dropped.' },
@@ -500,7 +550,7 @@ export function apply(ctx: Context): void {
       },
       render: (_a: unknown, v: unknown) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    async execute(args: { action?: string; title?: string; detail?: string; no?: number; reason?: string; all?: boolean; session?: string }, exec: { agent?: { session?: { id?: string } } }) {
+    async execute(args: { action?: string; title?: string; detail?: string; from_idx?: number; no?: number; reason?: string; all?: boolean; session?: string }, exec: { agent?: { session?: { id?: string } } }) {
       const sessionId = args.session ?? exec.agent?.session?.id
       if (typeof sessionId !== 'string') return { ok: false, error: 'no session' }
       const action = args.action ?? 'list'
@@ -514,7 +564,11 @@ export function apply(ctx: Context): void {
       if (action === 'add') {
         const title = (args.title ?? '').trim()
         if (title.length === 0) return { ok: false, error: 'title is required' }
-        const no = todos.add({ sessionId, title, detail: args.detail ?? '', fromIdx: undefined })
+        // 记下来源编号：用户说"这事记成待办"时最近的单位，便于日后再回去看原文。
+        // 优先用调用方显式给的 from_idx，否则取该会话最新编号。
+        const range = store.indexRange(sessionId)
+        const fromIdx = typeof args.from_idx === 'number' ? args.from_idx : range?.max
+        const no = todos.add({ sessionId, title, detail: args.detail ?? '', fromIdx })
         return { ok: true, rendered: `已登记待办 #${no}：${title}`, open: todos.stats(sessionId).open }
       }
 
@@ -593,6 +647,10 @@ export function apply(ctx: Context): void {
         byUser: args.by_user,
       })
       if (no === undefined) return { ok: false, error: `no unit #${args.idx}` }
+      // summary 变了，向量要重算（指纹会变，后台同步会自己捡起来，
+      // 这里显式清掉是为了让下一次检索立刻用上新摘要）
+      forgetVectors(vectorSeen, sessionId, args.idx)
+      scheduleVectorSync(sessionId)
       return { ok: true, rendered: `已覆写 #${args.idx} 的 summary（记录 #${no}），原文未改动` }
     },
     presentCall: (args: unknown) => ({ card: 'generic', title: 'memory_override', rawInput: args }),
