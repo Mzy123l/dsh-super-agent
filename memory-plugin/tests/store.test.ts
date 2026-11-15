@@ -205,3 +205,73 @@ describe('search 整合', () => {
     expect(hits.every(h => h.sessionId === 'a')).toBe(true)
   })
 })
+
+describe('关键词索引按近程窗口分档', () => {
+  const AT = '2026-11-15T00:00:00.000Z'
+
+  function seed(store: MemoryStore, n: number, from = 0): void {
+    for (let i = from; i < n; i += 1) {
+      store.appendUnit({
+        sessionId: 's', kind: 'thinking', summary: '',
+        content: `思考编号${i} 关键词 word${i}`, at: AT, inContext: true, tags: [],
+      })
+    }
+  }
+
+  it('窗口内的 thinking 正文可被关键词搜到', () => {
+    const store = new MemoryStore({ path: ':memory:' })
+    seed(store, 40)
+    store.refreshIndexTiers('s', 32)
+    expect(store.searchFts(buildFtsQuery('word39'), 5, 's').length).toBeGreaterThan(0)
+    store.close()
+  })
+
+  it('滑出窗口的 thinking 正文被降级，搜不到', () => {
+    const store = new MemoryStore({ path: ':memory:' })
+    seed(store, 40)
+    store.refreshIndexTiers('s', 32)
+    expect(store.searchFts(buildFtsQuery('word0'), 5, 's')).toHaveLength(0)
+    store.close()
+  })
+
+  it('继续追加后自动降级新滑出的、纳入新进入的', () => {
+    const store = new MemoryStore({ path: ':memory:' })
+    seed(store, 40)
+    store.refreshIndexTiers('s', 32)
+    seed(store, 50, 40)
+    store.refreshIndexTiers('s', 32)
+    expect(store.searchFts(buildFtsQuery('word10'), 5, 's')).toHaveLength(0)
+    expect(store.searchFts(buildFtsQuery('word49'), 5, 's').length).toBeGreaterThan(0)
+    store.close()
+  })
+
+  it('summary 无论档位都参与索引', () => {
+    const store = new MemoryStore({ path: ':memory:' })
+    seed(store, 40)
+    store.refreshIndexTiers('s', 32)
+    store.setSummary('s', 0, '提炼后的关键结论 targetkeyword')
+    expect(store.searchFts(buildFtsQuery('targetkeyword'), 5, 's').length).toBeGreaterThan(0)
+    store.close()
+  })
+
+  it('重复刷新是幂等的', () => {
+    const store = new MemoryStore({ path: ':memory:' })
+    seed(store, 40)
+    store.refreshIndexTiers('s', 32)
+    expect(store.refreshIndexTiers('s', 32)).toBe(0)
+    store.close()
+  })
+
+  it('非 thinking 正文不受窗口影响', () => {
+    const store = new MemoryStore({ path: ':memory:' })
+    for (let i = 0; i < 40; i += 1) {
+      store.appendUnit({
+        sessionId: 's', kind: 'reply', summary: '',
+        content: `回复${i} 词 token${i}`, at: AT, inContext: true, tags: [],
+      })
+    }
+    store.refreshIndexTiers('s', 32)
+    expect(store.searchFts(buildFtsQuery('token0'), 5, 's').length).toBeGreaterThan(0)
+    store.close()
+  })
+})

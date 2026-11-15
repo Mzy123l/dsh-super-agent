@@ -16,7 +16,7 @@
 import type { MemoryStore } from '../store/sqlite.js'
 import type { Unit } from '../types.js'
 import type { PendingStore, PendingSummary } from './pending.js'
-import { buildSummaryPrompt, isNoSummary, unitsNeedingSummary } from '../projection/render.js'
+import { buildSummaryPrompt, isNoSummary, summaryDecision, unitsNeedingSummary } from '../projection/render.js'
 
 /** 长单位阈值（字符数）。 */
 export const SUMMARY_THRESHOLD = 4000
@@ -82,9 +82,12 @@ export function runSummaryStep(sessionId: string, host: SummaryHost): SummaryAct
   const candidates = unitsNeedingSummary(units as Unit[], threshold)
   if (candidates.length === 0) return { kind: 'idle', reason: 'no unit needs a summary' }
 
-  // 一次只安排一个：串行、可预测
-  const target = candidates[0] as Unit
-  const promptText = buildSummaryPrompt(target.idx, target.kind)
+  // 一次只安排一个：串行、可预测。
+  // 长单位优先——`should-summarize` 必须做，`optional` 是顺手做，
+  // 先清掉硬性债务，避免长单位被一串"可选"单位无限押后。
+  const target = pickNext(candidates, threshold)
+  const decision = summaryDecision(target.content.length, threshold)
+  const promptText = buildSummaryPrompt(target.idx, target.kind, decision)
   host.pending.set({
     sessionId,
     unitIdx: target.idx,
@@ -93,6 +96,21 @@ export function runSummaryStep(sessionId: string, host: SummaryHost): SummaryAct
   })
 
   return { kind: 'inject', unitIdx: target.idx, promptText }
+}
+
+/**
+ * 从候选里挑下一个要总结的单位。
+ *
+ * 规则：`should-summarize` 档按编号升序优先；没有硬性候选时才轮到 `optional`，
+ * 同样按编号升序（最早的先做，保持时序感）。
+ *
+ * @param candidates - 候选单位（编号升序）。
+ * @param threshold - 长单位阈值。
+ */
+function pickNext(candidates: readonly Unit[], threshold: number): Unit {
+  const hard = candidates.filter(u => summaryDecision(u.content.length, threshold) === 'should-summarize')
+  if (hard.length > 0) return hard[0] as Unit
+  return candidates[0] as Unit
 }
 
 /**

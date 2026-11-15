@@ -142,7 +142,11 @@ export function apply(ctx: Context): void {
       const msgs = options.messages
       if (typeof sid === 'string' && Array.isArray(msgs)) {
         currentContext.set(sid, msgs)
-        syncUnits(store, sid, msgs, lastUnits, (t) => pending.isConsumedReply(sid, t))
+        syncUnits(
+          store, sid, msgs, lastUnits,
+          (t) => pending.isConsumedReply(sid, t),
+          pending.get(sid) !== undefined,
+        )
       }
     } catch (error) {
       ctx.logger.warn('memory-plugin: sync failed: %s', String(error))
@@ -656,7 +660,13 @@ export function apply(ctx: Context): void {
     /** 手动同步某会话的当前上下文（无自动触发）。 */
     sync: (sessionId: string) => {
       const msgs = currentContext.get(sessionId)
-      return msgs ? syncUnits(store, sessionId, msgs, lastUnits, (t) => pending.isConsumedReply(sessionId, t)) : undefined
+      return msgs
+        ? syncUnits(
+            store, sessionId, msgs, lastUnits,
+            (t) => pending.isConsumedReply(sessionId, t),
+            pending.get(sessionId) !== undefined,
+          )
+        : undefined
     },
     /** 某会话的编号范围。 */
     range: (sessionId: string) => store.indexRange(sessionId),
@@ -689,9 +699,11 @@ export function syncUnits(
   messages: readonly ContextMessage[],
   cache?: Map<string, number[]>,
   isConsumedReply?: (text: string) => boolean,
+  summaryInFlight?: boolean,
+  window?: number,
 ): number[] {
   const at = new Date().toISOString()
-  const units = extractUnits(messages, at, sessionId, isConsumedReply)
+  const units = extractUnits(messages, at, sessionId, isConsumedReply, summaryInFlight)
   const idxs: number[] = []
 
   for (const unit of units) {
@@ -707,6 +719,9 @@ export function syncUnits(
       if (!present.has(i)) store.markOutOfContext(sessionId, i)
     }
   }
+
+  // 近程窗口内的单位全量进关键词索引；滑出窗口的主动降级
+  store.refreshIndexTiers(sessionId, window ?? DEFAULT_WINDOW)
 
   cache?.set(sessionId, idxs)
   store.setMeta('lastIndexedAt', at)

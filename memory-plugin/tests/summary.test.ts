@@ -3,7 +3,7 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest'
 import { MemoryStore } from '../src/store/sqlite.js'
 import { PendingStore } from '../src/summary/pending.js'
-import { renderUnit, renderUnits, isRecent, unitsNeedingSummary, buildSummaryPrompt, isNoSummary, DEFAULT_WINDOW } from '../src/projection/render.js'
+import { renderUnit, renderUnits, isRecent, unitsNeedingSummary, buildSummaryPrompt, isNoSummary, summaryDecision, DEFAULT_WINDOW } from '../src/projection/render.js'
 import { runSummaryStep, SUMMARY_THRESHOLD, type SummaryHost } from '../src/summary/flow.js'
 import type { Unit } from '../src/types.js'
 
@@ -125,9 +125,18 @@ describe('提炼指令', () => {
     expect(p).toContain('effectively lost')
   })
 
-  it('给出 none 选项与只输出结果的约束', () => {
-    expect(p).toContain('reply with exactly: none')
-    expect(p).toContain('no preamble')
+  it('必做档（should-summarize）不提供 none 出口', () => {
+    const mandatory = buildSummaryPrompt(3, 'thinking', 'should-summarize')
+    expect(mandatory).toContain('Reply with the extraction only')
+    expect(mandatory).not.toContain('reply with exactly: none')
+    expect(mandatory).not.toContain('summarizing is optional')
+  })
+
+  it('可选档（optional）提供 none 出口', () => {
+    const optionalPrompt = buildSummaryPrompt(3, 'thinking', 'optional')
+    expect(optionalPrompt).toContain('reply with exactly: none')
+    expect(optionalPrompt).toContain('summarizing is optional')
+    expect(optionalPrompt).toContain('no preamble')
   })
 
   it('isNoSummary 能识别 none', () => {
@@ -252,5 +261,49 @@ describe('总结流程', () => {
     expect(renderUnit(u, true)).toContain('xxxxxxxx')
     // 远程渲染只剩 summary
     expect(renderUnit(u, false)).toBe('#0 <summary>要点</summary>')
+  })
+})
+
+describe('三档阈值', () => {
+  it('1200 及以下保留原文', () => {
+    expect(summaryDecision(500, SUMMARY_THRESHOLD)).toBe('keep-original')
+    expect(summaryDecision(1200, SUMMARY_THRESHOLD)).toBe('keep-original')
+  })
+
+  it('1200 到 4000 为可选', () => {
+    expect(summaryDecision(1201, SUMMARY_THRESHOLD)).toBe('optional')
+    expect(summaryDecision(3999, SUMMARY_THRESHOLD)).toBe('optional')
+  })
+
+  it('4000 及以上必须总结', () => {
+    expect(summaryDecision(4000, SUMMARY_THRESHOLD)).toBe('should-summarize')
+    expect(summaryDecision(9999, SUMMARY_THRESHOLD)).toBe('should-summarize')
+  })
+
+  it('候选只排除 keep-original 档', () => {
+    const short = unit({ idx: 0, content: 'x'.repeat(500) })
+    const mid = unit({ idx: 1, content: 'x'.repeat(2000) })
+    const long = unit({ idx: 2, content: 'x'.repeat(5000) })
+    const picked = unitsNeedingSummary([short, mid, long], SUMMARY_THRESHOLD)
+    expect(picked.map(u => u.idx)).toEqual([1, 2])
+  })
+
+  it('长单位优先于可选单位', () => {
+    // pickNext 未导出，按行为测：runSummaryStep 应先挑长单位
+    const store = new MemoryStore({ path: ':memory:' })
+    const pend = new PendingStore(store.raw)
+    store.appendUnit({ sessionId: 's', kind: 'reply', summary: '', content: 'x'.repeat(2000), at: '2026-11-15T00:00:00.000Z', inContext: true, tags: [] })
+    store.appendUnit({ sessionId: 's', kind: 'reply', summary: '', content: 'x'.repeat(5000), at: '2026-11-15T00:00:00.000Z', inContext: true, tags: [] })
+
+    const action = runSummaryStep('s', {
+      store,
+      pending: pend,
+      lastAssistantText: () => undefined,
+      lastAssistantAt: () => undefined,
+      warn: () => {},
+    })
+    expect(action.kind).toBe('inject')
+    if (action.kind === 'inject') expect(action.unitIdx).toBe(1) // 长单位 #1 优先于 #0
+    store.close()
   })
 })

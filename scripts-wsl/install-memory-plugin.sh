@@ -14,8 +14,9 @@ echo ""
 echo "=== 1. 同步源码到 ~/dsh-plugins/memory-plugin ==="
 mkdir -p "$HOME/dsh-plugins/memory-plugin"
 cd "$HOME/dsh-plugins/memory-plugin" || exit 1
-rm -rf src dist
+rm -rf src dist tests
 cp -rf "$REPO/memory-plugin/src" .
+cp -rf "$REPO/memory-plugin/tests" .
 cp -rf "$REPO/memory-plugin/scripts" .
 cp -f "$REPO/memory-plugin/package.json" \
       "$REPO/memory-plugin/tsconfig.json" \

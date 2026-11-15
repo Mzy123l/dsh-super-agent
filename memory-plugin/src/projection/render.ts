@@ -82,12 +82,48 @@ export function renderUnits(units: readonly Unit[], options: RenderOptions = {})
 /**
  * 找出需要总结的单位（长单位必须，短单位可选）。
  *
+ * 三档判定见 {@link summaryDecision}：只有 `keep-original` 档不参与，
+ * 其余两档都进入候选。
+ *
  * @param units - 单位列表。
  * @param threshold - 长单位阈值（字符数）。
  * @returns 需要总结的单位（长单位优先，按编号升序）。
  */
 export function unitsNeedingSummary(units: readonly Unit[], threshold: number): Unit[] {
-  return units.filter(u => u.summary.trim().length === 0 && u.content.length >= threshold)
+  return units.filter(u =>
+    u.summary.trim().length === 0 && summaryDecision(u.content.length, threshold) !== 'keep-original',
+  )
+}
+
+/**
+ * 短内容阈值（字符数）：低于此值原样保留，不总结。
+ *
+ * 太短的内容压缩没有收益，反而会丢细节——模型也难以写出比原文更短的提炼。
+ */
+export const KEEP_ORIGINAL_THRESHOLD_CHARS = 1_200
+
+/** 总结决策。 */
+export type SummaryDecision = 'keep-original' | 'optional' | 'should-summarize'
+
+/**
+ * 按长度决定是否总结（三档）。
+ *
+ * | 长度 | 决策 |
+ * | --- | --- |
+ * | ≤ 1200 | `keep-original`：原文够短，不总结 |
+ * | 1200 – 4000 | `optional`：由模型自行决定（可回 none） |
+ * | ≥ 4000 | `should-summarize`：必须提炼 |
+ *
+ * 4000 这条线来自 `threshold` 参数（默认 `SUMMARY_THRESHOLD`），
+ * 便于配置覆盖；1200 是固定下限，不随配置变。
+ *
+ * @param chars - 单位正文字符数。
+ * @param threshold - 长单位阈值（字符数）。
+ */
+export function summaryDecision(chars: number, threshold: number): SummaryDecision {
+  if (chars >= threshold) return 'should-summarize'
+  if (chars > KEEP_ORIGINAL_THRESHOLD_CHARS) return 'optional'
+  return 'keep-original'
 }
 
 /**
@@ -104,9 +140,11 @@ export function unitsNeedingSummary(units: readonly Unit[], threshold: number): 
  *
  * @param idx - 目标单位编号。
  * @param kind - 单位类型。
+ * @param decision - 三档决策；`optional` 档会额外说明"你可以回 none"。
  */
-export function buildSummaryPrompt(idx: number, kind: string): string {
+export function buildSummaryPrompt(idx: number, kind: string, decision: SummaryDecision = 'should-summarize'): string {
   const what = kind === 'thinking' ? 'reasoning trace' : kind === 'tool' ? 'tool call and its output' : 'reply'
+  const optional = decision === 'optional'
   return [
     `Condense unit #${idx} (a ${what}) into its essential information and drop the noise.`,
     ``,
@@ -123,8 +161,12 @@ export function buildSummaryPrompt(idx: number, kind: string): string {
     `whatever you leave out here is effectively lost. Write it carefully and completely enough`,
     `that you could resume the work from the summary alone.`,
     ``,
-    `If the unit is short and holds nothing worth keeping, reply with exactly: none`,
-    `Otherwise reply with the extraction only — no preamble, no commentary, no restating this instruction.`,
+    optional
+      ? `This unit is of moderate length, so summarizing is optional: if it holds nothing worth keeping, reply with exactly: none`
+      : `Reply with the extraction only — no preamble, no commentary, no restating this instruction.`,
+    ...(optional
+      ? [`Otherwise reply with the extraction only — no preamble, no commentary, no restating this instruction.`]
+      : []),
   ].join('\n')
 }
 

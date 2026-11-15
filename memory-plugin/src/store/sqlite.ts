@@ -45,9 +45,14 @@ interface Row {
 /**
  * 单位存储。
  *
- * 两条关键规则：
+ * 三条关键规则：
  * 1. 编号线性且永不改变（含 summary 挂接、老化标记）。
- * 2. thinking 的 content **不进 FTS**（只进向量），但它的 summary 进 FTS。
+ * 2. 关键词索引的收录范围分两档：
+ *    - **近程窗口内（默认最近 32 条）**：全量索引，thinking 的正文也进 FTS；
+ *    - **窗口外**：thinking 的正文不进 FTS（只进向量），其余照旧。
+ *    理由：窗口内的思考量有限且最可能被追问，全量索引收益最大；
+ *    窗口外思考量大，索引它们会让关键词结果被思考淹没。
+ * 3. summary 一旦存在，无论何档都参与 FTS（它是提纯后的关键信息）。
  */
 export class MemoryStore {
   private readonly db: BetterSqlite3
@@ -170,16 +175,67 @@ export class MemoryStore {
   /**
    * 重建一条单位的 FTS 记录。
    *
-   * 收录规则：summary + content；但 thinking 的 content 只进向量不进 FTS
-   * （既定决策：思考内容别索引，避免搜索命中过多）。
+   * 收录规则：
+   *   - summary 只要存在就收录（提纯后的关键信息，任何档位都要能搜到）
+   *   - 正文：非 thinking 一律收录；thinking 只在「近程窗口内」收录
+   *     （窗口内思考量有限且最可能被追问；窗口外思考量大，索引会淹没结果）
+   *
+   * @param row - 目标行。
+   * @param fullText - 是否全量索引正文（窗口内为真）。
    */
-  private reindexFts(row: Row): void {
+  private reindexFts(row: Row, fullText = false): void {
     const parts: string[] = []
     if (row.summary.trim().length > 0) parts.push(row.summary)
-    if (row.kind !== 'thinking') parts.push(row.content)
+    if (row.kind !== 'thinking' || fullText) parts.push(row.content)
     const text = parts.join('\n').trim()
     this.stmtFtsDelete.run(row.row_id)
     if (text.length > 0) this.stmtFtsInsert.run(row.row_id, segmentForFts(text))
+  }
+
+  /** 窗口内索引标记（写在 tags 里，避免改 schema）。 */
+  private static readonly FULL_INDEX_TAG = 'fts:full'
+
+  /**
+   * 按近程窗口重算关键词索引档位。
+   *
+   * 窗口边界会随新单位不断右移，滑出窗口的单位必须**主动降级**
+   * （thinking 正文退出 FTS）——否则它一行远停在全量索引态，永远不会被再次触及。
+   *
+   * 因此每次同步末尾调用一次，只处理档位真正变化的行。
+   *
+   * @param sessionId - 会话 id。
+   * @param window - 近程窗口大小（单位数）。
+   * @returns 本次重算的行数。
+   */
+  refreshIndexTiers(sessionId: string, window: number): number {
+    const range = this.indexRange(sessionId)
+    if (!range) return 0
+    const cutoff = range.max - window
+    const rows = this.db
+      .prepare(`SELECT * FROM message WHERE sessionId = ? AND idx > ?`)
+      .all(sessionId, cutoff) as Row[]
+    const stale = this.db
+      .prepare(
+        `SELECT * FROM message WHERE sessionId = ? AND idx <= ? AND tags LIKE ?`,
+      )
+      .all(sessionId, cutoff, `%${MemoryStore.FULL_INDEX_TAG}%`) as Row[]
+
+    let changed = 0
+    for (const row of rows) {
+      const tags = parseTags(row.tags)
+      if (tags.includes(MemoryStore.FULL_INDEX_TAG)) continue
+      tags.push(MemoryStore.FULL_INDEX_TAG)
+      this.db.prepare(`UPDATE message SET tags = ? WHERE row_id = ?`).run(JSON.stringify(tags), row.row_id)
+      this.reindexFts(row, true)
+      changed += 1
+    }
+    for (const row of stale) {
+      const tags = parseTags(row.tags).filter(t => t !== MemoryStore.FULL_INDEX_TAG)
+      this.db.prepare(`UPDATE message SET tags = ? WHERE row_id = ?`).run(JSON.stringify(tags), row.row_id)
+      this.reindexFts(row, false)
+      changed += 1
+    }
+    return changed
   }
 
   /** 标记某单位已离开上下文（编号保留）。 */
