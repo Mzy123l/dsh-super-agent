@@ -9,7 +9,7 @@
 // 不做：自动索引触发、总结类工具、压缩（后续单独设计）、dsh 自带压缩。
 
 import type { Context } from '@deepseek-ai/cordis'
-import { createUserMessage, type StreamChunk } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, type StreamChunk, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { MemoryStore } from './store/sqlite.js'
 import { PendingStore } from './summary/pending.js'
@@ -31,7 +31,20 @@ import type { Fold } from './types-modules.js'
 import { TodoStore, renderTodoList } from './todo/store.js'
 import { OverrideStore, renderOverrideHistory } from './override/store.js'
 import { PlanStore, checkPlanName, renderPlan } from './plan/store.js'
+import { askAction, runIntakeStep, shouldGate, type IntakePhase } from './plan/intake.js'
 import type { PlanStep } from './types-modules.js'
+
+/** 取一条 dsh 消息的可见文本（用于判断是否值得触发准入）。 */
+function textOfMessage(message: unknown): string {
+  const content = (message as { content?: unknown }).content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((b): b is { type?: string; text?: string } => b !== null && typeof b === 'object')
+    .filter(b => typeof b.text === 'string')
+    .map(b => (b.text as string).trim())
+    .filter(t => t.length > 0)
+    .join('\n')
+}
 
 /** 从 JSON 字符串解析步骤数组（容错）。 */
 function parseSteps(raw: string | undefined): PlanStep[] {
@@ -59,6 +72,7 @@ declare module '@deepseek-ai/dsh-llm' {
     'memory-summary-prompt': { kind: 'memory-summary-prompt' }
     'memory-plan-view': { kind: 'memory-plan-view' }
     'memory-projection': { kind: 'memory-projection' }
+    'memory-plan-intake': { kind: 'memory-plan-intake' }
   }
 }
 
@@ -80,6 +94,8 @@ export interface Config {
   threshold: number
   /** 是否启用自动总结 */
   autoSummary: boolean
+  /** 是否启用规划准入（先问耗时再决定建不建规划） */
+  autoPlan: boolean
 }
 
 function resolveConfig(): Config {
@@ -93,6 +109,7 @@ function resolveConfig(): Config {
     window: num(process.env.MEMORY_WINDOW, DEFAULT_WINDOW),
     threshold: num(process.env.MEMORY_SUMMARY_THRESHOLD, SUMMARY_THRESHOLD),
     autoSummary: process.env.MEMORY_AUTO_SUMMARY !== '0',
+    autoPlan: process.env.MEMORY_AUTO_PLAN !== '0',
   }
 }
 
@@ -122,6 +139,12 @@ export function apply(ctx: Context): void {
   const plans = new PlanStore(store.raw)
   /** 已写入 surface 的渲染缓存（避免重复 append） */
   const renderCache = new MemoryRenderCache()
+
+  /** 规划准入：各会话的暂扣/等答状态（内存即可，跨重启丢失只影响一次提问） */
+  const intakePhases = new Map<string, IntakePhase>()
+
+  /** 被暂扣的用户消息（等时间评估期间不还给模型） */
+  const heldMessages = new Map<string, UserMessage>()
 
   /** 各会话最近一条 assistant 可见文本与时刻（供收割）。 */
   const lastAssistant = new Map<string, { text: string; at: string }>()
@@ -188,6 +211,88 @@ export function apply(ctx: Context): void {
       const sessionId = (agent.session as { id?: string }).id
       if (typeof sessionId !== 'string' || sessionId.length === 0) return decision
       if (decision.kind === 'reject') return decision
+
+      // 0) 规划准入：暂扣用户消息 → 只问"要几分钟" → 收割后放回
+      //    必须在总结与投影之前，因为它可能整步替换 decision.messages。
+      if (config.autoPlan) {
+        const intakeHost = {
+          get: (sid: string) => intakePhases.get(sid) ?? { kind: 'idle' as const },
+          set: (sid: string, phase: IntakePhase) => { intakePhases.set(sid, phase) },
+          clear: (sid: string) => { intakePhases.delete(sid) },
+          lastAssistantText: (sid: string) => lastAssistant.get(sid)?.text,
+          lastAssistantAtMs: (sid: string) => {
+            const at = lastAssistant.get(sid)?.at
+            return at === undefined ? undefined : Date.parse(at)
+          },
+          plans,
+          warn: (m: string) => ctx.logger.warn('memory-plugin: %s', m),
+        }
+
+        const phase = intakeHost.get(sessionId)
+
+        // 收割：拿到时间后，把暂扣的原消息作为**本步**消息还给模型。
+        //
+        // 为什么不 inject 到 next-step：claim 在 preStep 开头就已完成，
+        // 这一步 inject 进去的消息要等下一个 step 才被取走；而本步若返回空数组，
+        // agent-loop 会直接判定 `decision.messages.length === 0` 并关闭这一轮。
+        // 直接作为本步消息返回最干净：零额外轮次，也不会与队列里的同 id 冲突。
+        //
+        // 气泡效果：原消息到这一步才 append（source.kind = 'user'）→ 显示为用户气泡，
+        // 即"用户消息气泡延后"，符合既定取舍。
+        if (phase.kind === 'awaiting') {
+          const action = runIntakeStep(sessionId, intakeHost)
+          if (action.kind === 'release') {
+            const held = heldMessages.get(sessionId)
+            heldMessages.delete(sessionId)
+            intakeHost.clear(sessionId)
+
+            if (action.needsPlan) {
+              ctx.logger.info(
+                'memory-plugin: estimate %s min >= 5, a plan is expected',
+                String(action.estimateMin ?? 'unknown'),
+              )
+            }
+
+            // 把原消息还回去；模型从这一步正式开始干活
+            if (held === undefined) return decision
+            // 把问句从本步摘掉（它已完成使命），换成原消息
+            const withoutAsk = decision.messages.filter(
+              m => (m as { source?: { kind?: string } }).source?.kind !== 'memory-plan-intake',
+            )
+            return { ...decision, messages: [...withoutAsk, held] }
+          }
+        }
+
+        // 提问：暂扣本次 claim 到的用户消息，本步只送问句
+        if (phase.kind === 'idle') {
+          const candidate = messages.find(m =>
+            shouldGate((m as { source?: { kind?: string } }).source?.kind, textOfMessage(m)),
+          )
+          if (candidate !== undefined) {
+            const candidateId = String((candidate as { id?: unknown }).id ?? '')
+            if (candidateId.length > 0) {
+              heldMessages.set(sessionId, candidate)
+              const ask = askAction(candidateId)
+              intakeHost.set(sessionId, {
+                kind: 'awaiting',
+                promptText: ask.promptText,
+                heldMessageId: candidateId,
+                askedAt: Date.now(),
+                attempts: 0,
+              })
+              // source.kind 不是 'user' → UI 渲染成「上下文注入」小标识，不是用户气泡
+              const prompt = createUserMessage({
+                content: [{ type: 'text', text: ask.promptText }],
+                source: { kind: 'memory-plan-intake' },
+              })
+              // 替换而非追加：把被暂扣的那条消息从本步摘掉，
+              // 但保留 runtime-context 等其余注入（那些不是用户任务）。
+              const kept = decision.messages.filter(m => m !== candidate)
+              return { ...decision, messages: [...kept, prompt] }
+            }
+          }
+        }
+      }
 
       // 1) 总结流程：先收割上一轮回复，再决定是否注入新指令
       if (config.autoSummary) {
