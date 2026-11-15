@@ -32,7 +32,7 @@ describe('窗口判定', () => {
   })
 
   it('默认窗口为 20', () => {
-    expect(DEFAULT_WINDOW).toBe(20)
+    expect(DEFAULT_WINDOW).toBe(32)
   })
 })
 

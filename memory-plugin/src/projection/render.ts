@@ -10,8 +10,8 @@
 
 import type { Unit } from '../types.js'
 
-/** 默认近程窗口（单位数量，完全不用 token）。 */
-export const DEFAULT_WINDOW = 20
+/** 默认近程窗口（单位数量，完全不用 token）。32 ≈ 5~7 轮。 */
+export const DEFAULT_WINDOW = 32
 
 /** 渲染选项。 */
 export interface RenderOptions {
