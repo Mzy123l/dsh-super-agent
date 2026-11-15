@@ -1,45 +1,71 @@
-// 公共 API 导出（规格 §1：index.ts 导出全部公共 API）
+// 公共导出。
+//
+// 核心模块不依赖 dsh，可独立测试与 CLI 使用；
+// dsh 适配（apply/inject/name）在 dsh-bundle.ts，
+// 必须从这里再导出——dsh 加载插件的入口是 package.json 的 main 字段。
 
-// 类型
+export { name, inject, apply, dispose, Config } from './dsh-bundle.js'
+
 export type {
-  MemoryRecord,
-  MemoryRecordResult,
-  ReasoningRecord,
-  ReasoningHit,
-  RecordKind,
+  Role,
+  MessageRecord,
+  MessageResult,
+  KeywordHit,
+  VectorRecordId,
   EmbeddingProvider,
   VectorStore,
-  VectorRecordId,
-  ExtractResult,
-  SessionWatermark,
   IndexStatus,
   SearchMode,
   SearchOptions,
   IndexerConfig,
+  SessionFile,
+  IndexReport,
+  Segment,
 } from './types.js'
 
-// 存储
-export { MemoryStore } from './store/sqlite.js'
+export { MemoryStore, parseTags } from './store/sqlite.js'
 
-// 提取/读取
-export { readSessionLog, scanZstdFrames } from './ingest/log-reader.js'
-export { extractFromEvents, TEXT_SLICE } from './ingest/extractor.js'
-export { discoverSessionFiles, indexAll, indexSession, type IndexReport } from './ingest/indexer.js'
-
-// 搜索
-export { keywordSearch, buildFtsQuery } from './search/keyword.js'
-export { NoopVectorStore, OpenAICompatVectorStore, OpenAICompatEmbedding, cosine, resolveVectorHits } from './search/vector.js'
-export { rrfMerge, mergeSearch, RRF_K } from './search/merge.js'
-export { search, searchReasoning, type SearchContext } from './search/index.js'
-
-// API
-export { startApiServer, type ApiServerOptions } from './api/server.js'
-
-// dsh bundle 适配层（仅在 dsh 环境里可用；独立使用 CLI 时不需要）
 export {
-  name,
-  inject,
-  apply,
-  dispose,
-  type Config,
-} from './dsh-bundle.js'
+  SegmentStore,
+  composeSlottedText,
+  isSlottedText,
+  decideSummarize,
+  buildSummarizePrompt,
+  SLOT_TAGS,
+  KEEP_ORIGINAL_THRESHOLD_CHARS,
+  SUMMARIZE_THRESHOLD_CHARS,
+} from './seal/types.js'
+export type { Slot, SlotKind, SummarizeDecision } from './seal/types.js'
+
+export {
+  syncContext,
+  visibleText,
+  shouldIndex,
+  normalizeRole,
+  labelInPlace,
+} from './ingest/context-sync.js'
+export type { ContextMessage } from './ingest/context-sync.js'
+
+export { search, parseVectorId, vectorId } from './search/index.js'
+export type { SearchContext, SearchHit } from './search/index.js'
+
+export {
+  SqliteVectorStore,
+  HashingEmbedding,
+  cosine,
+  tokenize,
+} from './search/vector.js'
+
+export { segmentForFts, buildFtsQuery } from './search/segment.js'
+
+export { PendingStore } from './loop/store.js'
+export type { PendingInject } from './loop/store.js'
+
+export {
+  runLoopStep,
+  computeSpans,
+  archiveDue,
+  renderSegment,
+  PENDING_TTL_MS,
+} from './loop/engine.js'
+export type { LoopAction, LoopHost, Span } from './loop/engine.js'

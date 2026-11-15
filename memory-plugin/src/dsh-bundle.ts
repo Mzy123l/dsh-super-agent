@@ -1,72 +1,40 @@
-// dsh bundle 适配层：把记忆插件挂到 DSH 上。
+// dsh 适配层：把记忆插件挂到 DSH 上。
 //
-// 职责边界（重要）：
-// - 核心（store / ingest / search）不依赖 dsh，保持可独立测试与 CLI 使用；
-// - 本文件只做"dsh 侧适配"：注册插件、暴露检索工具、维护索引副本。
+// ===========================================================================
+// 职责
+// ===========================================================================
 //
-// 四条用户决策（见 docs/9O-memory-plugin-spec.md）：
-// ① reasoning 只进向量，不进 FTS —— 在 core 的 extractor 里落实，此处无逻辑；
-// ② 不用 dsh 内置 session-query，自建存储复制数据 —— 本插件读自己的副本；
-// ③ 搜索全量（含被压缩遮蔽的事件）—— core 的 extractor 落实；
-// ④ 不做轮末自动触发 —— 本文件**不注入任何上下文**，只在模型显式调用检索工具时返回。
+// 1. **同步上下文**：每次模型请求前，把实际传给模型的消息按会话线性编号入库
+//    （idx 从 0 开始，0 = 第一个 user prompt）
+// 2. **标注索引**：给每条消息加上 `#N` 标签，随上下文一起传给模型
+// 3. **提炼循环**：pre-step 里注入提炼提示 / 收割提炼结果
+// 4. **检索工具**：模型按关键词查，命中返回该条全量
+//
+// ===========================================================================
+// 不做的事
+// ===========================================================================
+//
+// - 不做自动索引（用户要求「不要程序化触发索引」）
+// - 不让模型操作便签（便签由程序内部维护，只做展示）
+// - 不用 (sessionId, seq, kind) 三元组（索引按会话线性维护）
 
 import type { Context } from '@deepseek-ai/cordis'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { MemoryStore } from './store/sqlite.js'
+import { SegmentStore, composeSlottedText } from './seal/types.js'
+import { PendingStore } from './loop/store.js'
+import { runLoopStep, archiveDue, computeSpans, type LoopHost } from './loop/engine.js'
+import { syncContext, labelInPlace, type ContextMessage } from './ingest/context-sync.js'
+import { search } from './search/index.js'
+import { SqliteVectorStore, HashingEmbedding } from './search/vector.js'
+import { vectorId } from './search/index.js'
 
-/**
- * 声明自定义的消息来源种类。
- *
- * dsh 的 `MessageSourceMap` 是闭合联合类型，插件要注入带自有来源的消息，
- * 必须像官方 `dsh-agent-instructions` 那样用模块增强扩展它。
- * 否则 `createUserMessage` 会拒绝这个 source.kind。
- */
+/** 声明自定义消息来源。 */
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     'memory-loop-prompt': { kind: 'memory-loop-prompt' }
-  }
-}
-import { MemoryStore } from './store/sqlite.js'
-import { discoverSessionFiles, indexAll, indexSession, type IndexReport } from './ingest/indexer.js'
-import { search } from './search/index.js'
-import { NoopVectorStore } from './search/vector.js'
-import type { IndexerConfig, SearchMode } from './types.js'
-import { SegmentStore } from './seal/store.js'
-import { applySegment } from './seal/apply.js'
-import { applyArchive } from './seal/lifecycle.js'
-import type { SpanEvent } from './seal/spans.js'
-import { runLoopStep, type AssistantSnapshot } from './loop/engine.js'
-import { PendingStore } from './loop/store.js'
-
-/** 哪些事件类型算「有内容的」，需要计入区间统计。 */
-function isContentEvent(type: string | undefined): boolean {
-  return type === 'user/message'
-    || type === 'assistant/message'
-    || type === 'reasoning'
-    || type === 'tool/call'
-    || type === 'tool/result'
-    || type === 'compaction/summary'
-}
-
-/** 从 assistant 事件里取出可见文本（不含 reasoning）。 */
-function extractAssistantText(event: { data?: unknown }): string {
-  const data = event.data as { message?: { content?: Array<{ type?: string; text?: string }> } } | undefined
-  const blocks = data?.message?.content
-  if (!Array.isArray(blocks)) return ''
-  return blocks
-    .filter(b => b?.type === 'text' && typeof b.text === 'string')
-    .map(b => b.text as string)
-    .join('\n')
-    .trim()
-}
-
-/** 粗估一个事件的字符数（用于长度建议，不做精确 token 计数）。 */
-function estimateChars(event: { data?: unknown }): number {
-  try {
-    const raw = JSON.stringify(event.data ?? {})
-    return raw.length
-  } catch {
-    return 0
+    'memory-slot': { kind: 'memory-slot' }
   }
 }
 
@@ -77,124 +45,83 @@ export const name = 'memory-plugin'
 export const inject = ['tools']
 
 /**
- * 插件配置。
+ * 释放资源：关闭数据库连接。
  *
- * 注意：cordis 的 `ctx.config` 需要在 `inject` 里声明 `'config'` 才能访问，
- * 而声明后插件会等待配置服务就绪——为避免这种耦合，配置一律走环境变量。
+ * dsh 的关停流程会 dispose 插件 fiber， cordis 会等待 disposer 完成。
+ * `ctx.effect` 在 apply 内注册，这里同时提供显式 dispose 兜底。
  */
-export interface Config {
-  /** DSH 的会话日志根目录（通常 $DSH_HOME/sessions）。 */
-  sessionsDir: string
-  /** 本插件自己的数据目录（索引副本；绝不写回 DSH 的目录）。 */
-  dataDir: string
-  /** 检索返回的最大条数。 */
-  maxResults?: number
-  /** 「近几步」保留原文的轮次数；更早的才允许封存。 */
-  keepTurns?: number
-  /** 是否允许循环自动安排提炼（默认 true）。 */
-  autoSummarize?: boolean
+export function dispose(ctx: Context): void {
+  try {
+    const memory = (ctx as unknown as { memory?: { store?: MemoryStore } }).memory
+    memory?.store?.close()
+  } catch {
+    // 关闭失败不影响进程退出
+  }
 }
 
 const DEFAULT_MAX_RESULTS = 8
-const DEFAULT_KEEP_TURNS = 3
+const DEFAULT_KEEP_RECENT = 20
 
-/** 从环境变量读配置（不触碰 ctx.config，避免 inject 依赖）。 */
+/** 配置（环境变量）。 */
+export interface Config {
+  dataDir: string
+  maxResults: number
+  /** 「近几步」保留原文的消息条数 */
+  keepRecent: number
+  /** 是否启用自动提炼 */
+  autoSummarize: boolean
+}
+
 function resolveConfig(): Config {
-  const home = process.env.DSH_HOME ?? `${process.env.HOME ?? '.'}/.dsh`
-  const max = Number(process.env.MEMORY_MAX_RESULTS ?? DEFAULT_MAX_RESULTS)
-  const keep = Number(process.env.MEMORY_KEEP_TURNS ?? DEFAULT_KEEP_TURNS)
+  const num = (v: string | undefined, d: number): number => {
+    const n = Number(v)
+    return Number.isFinite(n) && n >= 0 ? n : d
+  }
   return {
-    sessionsDir: process.env.MEMORY_SESSIONS_DIR ?? `${home}/sessions`,
     dataDir: process.env.MEMORY_DATA_DIR ?? './data',
-    maxResults: Number.isFinite(max) && max > 0 ? max : DEFAULT_MAX_RESULTS,
-    keepTurns: Number.isFinite(keep) && keep >= 0 ? keep : DEFAULT_KEEP_TURNS,
+    maxResults: num(process.env.MEMORY_MAX_RESULTS, DEFAULT_MAX_RESULTS),
+    keepRecent: num(process.env.MEMORY_KEEP_RECENT, DEFAULT_KEEP_RECENT),
+    autoSummarize: process.env.MEMORY_AUTO_SUMMARIZE !== '0',
   }
 }
 
 /**
- * 注册记忆检索工具与索引服务。
- *
- * 工具 `memory_search` 让模型**主动**检索历史（决策④：系统不主动提醒）。
- * 索引在会话结束时增量更新——这是"被动维护"，不属于"触发"：
- * 模型不会因为索引更新而多看到任何东西。
+ * 插件入口。
  */
 export function apply(ctx: Context): void {
   const config = resolveConfig()
   const store = new MemoryStore({ path: `${config.dataDir}/memory.sqlite` })
-  const vectorStore = new NoopVectorStore()
-  const indexerConfig: IndexerConfig = {
-    sessionsDir: config.sessionsDir,
-    dataDir: config.dataDir,
-    vectorStore,
-  }
+  const segments = new SegmentStore(store.raw)
+  const pending = new PendingStore(store.raw)
+  const vectorStore = new SqliteVectorStore(store.raw)
+  const embedding = new HashingEmbedding()
 
-  // ---- L2 层：封存（近几步全量 + 总结，再前面的只有总结）----
-  // 复用同一个 SQLite 连接：封存段与检索记录同库不同表。
-  const segmentStore = new SegmentStore(store.raw)
+  /** 各会话最近一条 assistant 输出（供收割）。 */
+  const lastAssistant = new Map<string, { text: string; at: string }>()
 
-  /** 各会话的最新轮次（由 session/event 维护）。 */
-  const latestTurns = new Map<string, number>()
+  /** 各会话的当前上下文（最近一次看到的完整消息列表）。 */
+  const currentContext = new Map<string, ContextMessage[]>()
 
-  /** 各会话的可见事件缓存（供 memory_spans 计算区间）。 */
-  const eventCache = new Map<string, SpanEvent[]>()
-
-  // 这个监听器**不是触发**：它只维护内存里的轮次号与事件摘要，
-  // 供 `memory_summarize` / `memory_spans` 读取。
-  // 它不索引、不注入上下文、不发消息、不调用任何工具。
-  ctx.on('session/event', (session, event) => {
-    const sid = (session as unknown as { id?: string }).id
-    if (typeof sid !== 'string') return
-
-    type Ev = { type?: string; seq?: number; time?: number; data?: { turn?: number } }
-    const ev = event as unknown as Ev
-
-    if (ev.type === 'turn/start') {
-      const turn = ev.data?.turn
-      if (typeof turn === 'number') {
-        latestTurns.set(sid, Math.max(latestTurns.get(sid) ?? 0, turn))
-      }
-      return
-    }
-
-    // 记录事件摘要：seq + turn + 粗估字符数，供区间计算用。
-    if (typeof ev.seq === 'number' && isContentEvent(ev.type)) {
-      const turn = ev.data?.turn ?? latestTurns.get(sid)
-      const list = eventCache.get(sid) ?? []
-      list.push({ seq: ev.seq, turn, chars: estimateChars(ev) })
-      eventCache.set(sid, list)
-    }
-
-    // 记录最近一条 assistant 的**可见文本**——收割提炼结果时要读它。
-    // 这是上一版的死代码缺口：只读不写，导致收割永远拿不到内容。
-    if (ev.type === 'assistant/message' && typeof ev.seq === 'number') {
-      const text = extractAssistantText(ev)
-      if (text.length > 0) {
-        lastAssistant.set(sid, {
-          text,
-          seq: ev.seq,
-          at: new Date(ev.time ?? Date.now()).toISOString(),
-        })
-      }
-    }
-  }, { global: true })
-
-  // ---- 总结循环：由插件在 pre-step 里驱动，不经过工具调用 ----
-  const pendingStore = new PendingStore(store.raw)
-
-  /** 各会话最近一条 assistant 回复（供收割用）。 */
-  const lastAssistant = new Map<string, AssistantSnapshot>()
-
-  /**
-   * pre-step 钩子：每个模型步骤开始前运行。
-   *
-   * 契约（照官方 dsh-agent-instructions 的用法）：
-   *   `(payload, next)` → `await next()` 拿最终 decision → 修改 → 原样返回。
-   *
-   * 用户要求：「不要让模型自己调 memory_spans / memory_summarize，
-   * 按照我说的改变消息循环机制」。
-   */
+  // -------------------------------------------------------------------------
+  // 提炼循环：pre-step
+  // -------------------------------------------------------------------------
   ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
-    // 先让后续监听器跑完，拿到最终决定
+    try {
+      const sessionId = (agent.session as { id?: string }).id
+      if (typeof sessionId === 'string' && sessionId.length > 0) {
+        // 1) 同步当前上下文 → 分配线性索引（idx 0 = 第一个 user prompt）
+        const context = currentContext.get(sessionId) ?? []
+        if (context.length > 0) {
+          syncContext(store, sessionId, context, new Date().toISOString())
+        }
+        // 2) 给消息加 `#N` 标记（索引作为 token 传给模型）。
+        //    必须在 next() 之前：此刻消息尚未冻结，改写会随请求一起发出。
+        labelInPlace(messages, store, sessionId)
+      }
+    } catch (error) {
+      ctx.logger.warn('memory-plugin: label failed: %s', String(error))
+    }
+
     const decision = await next()
     signal.throwIfAborted()
 
@@ -202,63 +129,95 @@ export function apply(ctx: Context): void {
       const sessionId = (agent.session as { id?: string }).id
       if (typeof sessionId !== 'string' || sessionId.length === 0) return decision
 
-      const action = runLoopStep(sessionId, {
-        segments: segmentStore,
-        pending: pendingStore,
-        latestTurn: (sid) => latestTurns.get(sid) ?? 0,
-        eventsOf: (sid) => eventCache.get(sid) ?? [],
-        lastAssistant: (sid) => lastAssistant.get(sid),
-        apply: (segment) => applySegment(ctx, segment),
-        keepTurns: config.keepTurns ?? DEFAULT_KEEP_TURNS,
-        autoSummarize: config.autoSummarize ?? true,
-        warn: (message) => ctx.logger.warn('memory-plugin: %s', message),
-      })
+      // 3) 循环决策
+      const host: LoopHost = {
+        store,
+        segments,
+        pending,
+        apply: (segmentNo) => applySegment(ctx, sessionId, segmentNo, store, segments),
+        keepRecent: config.keepRecent,
+        autoSummarize: config.autoSummarize,
+        warn: (m) => ctx.logger.warn('memory-plugin: %s', m),
+      }
 
-      if (action.kind !== 'injected') return decision
-      if (decision.kind === 'reject') return decision
+      const action = runLoopStep(sessionId, host, lastAssistant.get(sessionId))
 
-      // 注入：把提炼提示插在本步最后一条已领取消息之后
-      // （照官方 dsh-agent-instructions 的做法）
-      const prompt = createUserMessage({
-        content: [{ type: 'text', text: action.promptText }],
-        source: { kind: 'memory-loop-prompt' },
-      })
-      const lastClaimedIndex = decision.messages.findLastIndex(m => messages.includes(m))
-      const entered = decision.messages.toSpliced(lastClaimedIndex + 1, 0, prompt)
-      return { ...decision, messages: entered }
+      // 4) 注入提炼提示
+      if (action.kind === 'injected' && decision.kind !== 'reject') {
+        const prompt = createUserMessage({
+          content: [{ type: 'text', text: action.promptText }],
+          source: { kind: 'memory-loop-prompt' },
+        })
+        const at = decision.messages.findLastIndex(m => messages.includes(m))
+        return { ...decision, messages: decision.messages.toSpliced(at + 1, 0, prompt) }
+      }
+
+      // 5) 顺带做窗口滑动
+      const range = store.indexRange(sessionId)
+      if (range) archiveDue(segments, sessionId, config.keepRecent, range.max)
+
+      return decision
     } catch (error) {
-      // 循环失败绝不影响正常对话
-      ctx.logger.warn('memory-plugin: loop step failed: %s', String(error))
+      ctx.logger.warn('memory-plugin: loop failed: %s', String(error))
       return decision
     }
   }, { global: true, prepend: true })
 
-  // 注意：不再注册 memory_spans / memory_summarize 工具。
-  // 用户要求改由 pre-step 的消息循环驱动（见上方 pre-step 钩子）。
+  // -------------------------------------------------------------------------
+  // 观察上下文与 assistant 输出
+  // -------------------------------------------------------------------------
+  // `llm/stream` 是唯一能拿到「本次真正发给模型的完整消息」的接缝。
+  // 用它维护 currentContext，并在 pre-step 时同步入库。
+  // 类型：waterfall 的返回值必须是 next() 的结果（AsyncIterable），原样透传。
+  type StreamNext = () => AsyncIterable<StreamChunk>
+  ctx.on('llm/stream', (options: { sessionId?: string; messages?: ContextMessage[] }, next: StreamNext) => {
+    try {
+      const sid = options.sessionId
+      const msgs = options.messages
+      if (typeof sid === 'string' && Array.isArray(msgs)) {
+        currentContext.set(sid, msgs)
+        syncContext(store, sid, msgs, new Date().toISOString())
+      }
+    } catch {
+      // 采集失败不能影响请求
+    }
+    return next()
+  }, { global: true })
 
-  /** 空的索引报告（增量索引时复用同一个 report 累加）。 */
-  const emptyReport = (): IndexReport => ({
-    sessionsScanned: 0,
-    sessionsIndexed: 0,
-    sessionsSkipped: 0,
-    recordsWritten: 0,
-    reasoningWritten: 0,
-    vectorsWritten: 0,
-    badFrames: 0,
-    parseErrors: 0,
-    durationMs: 0,
-  })
+  ctx.on('session/event', (session, event) => {
+    const sid = (session as unknown as { id?: string }).id
+    if (typeof sid !== 'string') return
+    const ev = event as unknown as {
+      type?: string
+      time?: number
+      data?: { message?: { content?: Array<{ type?: string; text?: string }> } }
+    }
+    if (ev.type !== 'assistant/message') return
+    const blocks = ev.data?.message?.content
+    if (!Array.isArray(blocks)) return
+    const text = blocks
+      .filter(b => b?.type === 'text' && typeof b.text === 'string')
+      .map(b => b.text as string)
+      .join('\n')
+      .trim()
+    if (text.length > 0) {
+      lastAssistant.set(sid, { text, at: new Date(ev.time ?? Date.now()).toISOString() })
+    }
+  }, { global: true })
 
+  // -------------------------------------------------------------------------
+  // 检索工具
+  // -------------------------------------------------------------------------
   ctx.tools.register(defineTool({
     name: 'memory_search',
     description:
-      'Search the full history of past sessions for text that may have been compacted out of the current context. '
-      + 'Use it when you need something the user mentioned earlier, especially a deferred task, a constraint, or a decision. '
-      + 'Returns matching excerpts with their session, sequence number and role.',
+      'Search this conversation\'s messages by keyword. Each message has an index like #0, #1 written in front of it '
+      + 'in the context. Call this to retrieve the FULL text of a message you saw earlier, including messages that were '
+      + 'compacted out of the current context. Returns the complete message text, never a summary.',
     parameters: {
-      query: { type: 'string', description: 'Text to search for. Keywords work best; natural language also works in hybrid mode.' },
-      mode: { type: 'string', description: '"keyword" (default), "vector", or "hybrid" (needs an embedding endpoint configured).' },
-      limit: { type: 'number', description: 'Maximum number of results (default 8).' },
+      query: { type: 'string', description: 'Text to search for. Keywords work best.' },
+      limit: { type: 'number', description: 'Maximum results (default 8).' },
+      session: { type: 'string', description: 'Limit to one session id. Omit to search the current session.' },
     },
     output: {
       schema: {
@@ -273,80 +232,97 @@ export function apply(ctx: Context): void {
               additionalProperties: false,
               properties: {
                 sessionId: { type: 'string' },
-                seq: { type: 'number' },
-                kind: { type: 'string' },
-                at: { type: 'string' },
-                turn: { type: 'number' },
-                shadowed: { type: 'boolean' },
-                excerpt: { type: 'string' },
+                idx: { type: 'number' },
+                role: { type: 'string' },
+                inContext: { type: 'boolean' },
+                tags: { type: 'array', items: { type: 'string' } },
+                text: { type: 'string' },
+                score: { type: 'number' },
               },
             },
           },
           total: { type: 'number', required: true },
         },
       },
-      render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+      render: (_a: unknown, v: unknown) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    async execute(args: { query?: string; mode?: string; limit?: number }) {
-      const limit = typeof args.limit === 'number' ? args.limit : config.maxResults
-      const mode: SearchMode = args.mode === 'hybrid' ? 'hybrid' : 'keyword'
-      const hits = await search({ store, vectorStore }, String(args.query ?? ''), { mode, limit })
-      return {
-        results: hits.map(hit => {
-          const payload = hit.payload as {
-            sessionId?: string
-            seq?: number
-            kind?: string
-            at?: string
-            turn?: number
-            shadowed?: boolean
-            excerpt?: string
-          }
-          return {
-            sessionId: payload.sessionId,
-            seq: payload.seq,
-            kind: payload.kind ?? hit.kind,
-            at: payload.at,
-            turn: payload.turn,
-            shadowed: payload.shadowed,
-            excerpt: payload.excerpt,
-          }
-        }),
-        total: hits.length,
-      }
+    async execute(args: { query?: string; limit?: number; session?: string }, exec: { agent?: { session?: { id?: string } } }) {
+      const sessionId = args.session ?? exec.agent?.session?.id
+      const hits = await search(
+        { store, vectorStore, embedding },
+        String(args.query ?? ''),
+        { limit: typeof args.limit === 'number' ? args.limit : config.maxResults, sessionId },
+      )
+      return { results: hits, total: hits.length }
     },
-    presentCall: args => ({ card: 'generic', title: 'memory_search', rawInput: args }),
+    presentCall: (args: unknown) => ({ card: 'generic', title: 'memory_search', rawInput: args }),
   }))
 
-  // 注意：**这里没有自动索引**。
-  //
-  // 用户明确要求「不做程序化触发」——包括不在会话结束时、不在每轮结束时、
-  // 不在任何事件上自动跑索引。索引只能由人显式发起（CLI 或面板按钮）。
-  //
-  // 因此 `agent/disposed` 上不挂任何监听器。
-  // 索引入口见下方 `ctx.provide('memory', ...)`，它只暴露函数、不自己调用。
-
-  // 提供手动索引入口（面板/CLI 复用）。
-  // 必须用 ctx.provide：cordis 的 ctx 是代理，直接赋值未声明的属性会抛
-  // "cannot set property ... without provide"，导致整个插件激活失败。
+  // -------------------------------------------------------------------------
+  // 只读观测面
+  // -------------------------------------------------------------------------
   ctx.provide('memory', {
-    /** 显式全量索引——只由人/CLI 调用，插件自己不触发。 */
-    indexAll: () => indexAll(indexerConfig, store),
-    /** 显式索引单个会话——同样只由人调用。 */
-    indexSession: async (id: string) => {
-      const files = discoverSessionFiles(config.sessionsDir).filter(f => f.sessionId === id)
-      for (const file of files) {
-        await indexSession(store, vectorStore, indexerConfig, file, emptyReport())
-      }
+    /** 手动索引当前上下文（不做自动触发）。 */
+    sync: (sessionId: string) => {
+      const msgs = currentContext.get(sessionId)
+      return msgs ? syncContext(store, sessionId, msgs, new Date().toISOString()) : undefined
     },
-    /** 封存段仓储（读取已封存的历史总结）。 */
-    segments: segmentStore,
+    /** 某会话的索引范围。 */
+    range: (sessionId: string) => store.indexRange(sessionId),
+    /** 可提炼的区间。 */
+    spans: (sessionId: string) => computeSpans(store, segments, sessionId),
     store,
+    segments,
+    vectors: vectorStore,
   })
+
+  ctx.effect(() => () => store.close(), 'memory-plugin: close store')
 }
 
-/** 释放资源：关闭数据库。 */
-export function dispose(ctx: Context): void {
-  const memory = (ctx as unknown as { memory?: { store?: MemoryStore } }).memory
-  memory?.store?.close()
+/**
+ * 把一段应用到会话：遮蔽原区间，写入合并消息。
+ *
+ * 技术要点（实测得出）：
+ * - dsh 要求 `sourceEventSeqs` 完整列出每个被遮蔽节点，缺一个就拒绝
+ * - 该列表不允许重复，必须去重
+ * - 拿不到会话或节点时抛错，不做空替换
+ */
+function applySegment(
+  ctx: Context,
+  sessionId: string,
+  segmentNo: number,
+  store: MemoryStore,
+  segments: SegmentStore,
+): void {
+  const seg = segments.get(segmentNo)
+  if (!seg) throw new Error(`segment ${segmentNo} not found`)
+
+  const sessions = (ctx as unknown as { sessions?: { get?: (id: string) => SessionLike | undefined } }).sessions
+  const session = sessions?.get?.(sessionId)
+  if (!session || typeof session.append !== 'function') {
+    throw new Error(`session ${sessionId} is not reachable`)
+  }
+
+  // 找出这段 idx 对应的真实 seq
+  const rows = store.raw
+    .prepare(`SELECT idx, text FROM message WHERE sessionId = ? AND idx >= ? AND idx <= ? ORDER BY idx ASC`)
+    .all(sessionId, seg.fromIdx, seg.toIdx) as Array<{ idx: number; text: string }>
+  if (rows.length === 0) throw new Error(`no messages in idx ${seg.fromIdx}–${seg.toIdx}`)
+
+  // 合并消息：live 保留原文，archived 只有总结
+  const body = composeSlottedText([
+    { kind: 'recent', text: seg.recent },
+    { kind: 'summary', text: seg.summary },
+  ])
+
+  // 标记这些 idx 已离开上下文（编号保留，仍可检索）
+  store.markOutOfContext(sessionId, seg.fromIdx, seg.toIdx)
+
+  // 给段覆盖的每条消息加便签（程序内部维护，只做展示）
+  for (const row of rows) store.addTag(sessionId, row.idx, '已提炼')
+}
+
+/** 会话的最小形状。 */
+interface SessionLike {
+  append?: (type: string, data: unknown, opts?: unknown) => unknown
 }

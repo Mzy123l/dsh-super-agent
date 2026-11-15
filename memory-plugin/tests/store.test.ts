@@ -1,167 +1,138 @@
-// 事件存储测试：编号规则、幂等、FTS、水位线。
-//
-// 重点验证「每个事件一个编号，且编号在会话内独立递增」。
+// 存储与索引测试：验证「会话内线性编号」是核心不变量。
 
 import { describe, expect, it, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MemoryStore } from '../src/store/sqlite.js'
-import type { EventRecord } from '../src/types.js'
-import { keywordSearch } from '../src/search/keyword.js'
+import { buildFtsQuery, segmentForFts } from '../src/search/segment.js'
 
-/** 造一个事件。 */
-function ev(over: Partial<EventRecord> = {}): EventRecord {
-  return {
-    sessionId: 'session-a',
-    seq: 1,
-    kind: 'user',
-    at: '2026-11-15T00:00:00.000Z',
-    text: '默认内容',
-    ...over,
-  }
-}
-
-describe('MemoryStore 事件编号', () => {
+describe('线性索引', () => {
   let store: MemoryStore
-  beforeEach(() => {
-    store = new MemoryStore({ path: ':memory:' })
-  })
-  afterEach(() => {
-    store.close()
+  beforeEach(() => { store = new MemoryStore({ path: ':memory:' }) })
+  afterEach(() => { store.close() })
+
+  it('第一条消息 idx = 0', () => {
+    const idx = store.appendMessage({
+      sessionId: 's', role: 'user', text: '第一个 prompt', at: '2026-01-01T00:00:00Z',
+    })
+    expect(idx).toBe(0)
   })
 
-  it('同一会话内编号从 1 开始逐条递增', () => {
-    expect(store.insertEvent(ev({ seq: 1 }), false)).toBe(1)
-    expect(store.insertEvent(ev({ seq: 2 }), false)).toBe(2)
-    expect(store.insertEvent(ev({ seq: 3 }), false)).toBe(3)
+  it('严格线性递增，无空洞', () => {
+    const idxs = ['a', 'b', 'c', 'd'].map((t, i) =>
+      store.appendMessage({ sessionId: 's', role: i % 2 ? 'assistant' : 'user', text: t, at: 'x' }))
+    expect(idxs).toEqual([0, 1, 2, 3])
   })
 
-  it('不同会话各自独立编号，互不影响', () => {
-    expect(store.insertEvent(ev({ sessionId: 'a', seq: 1 }), false)).toBe(1)
-    expect(store.insertEvent(ev({ sessionId: 'a', seq: 2 }), false)).toBe(2)
-    // 会话 b 从 1 重新开始
-    expect(store.insertEvent(ev({ sessionId: 'b', seq: 1 }), false)).toBe(1)
-    expect(store.insertEvent(ev({ sessionId: 'b', seq: 2 }), false)).toBe(2)
-    // 回到 a，继续 3
-    expect(store.insertEvent(ev({ sessionId: 'a', seq: 3 }), false)).toBe(3)
+  it('不同会话各自从 0 开始', () => {
+    expect(store.appendMessage({ sessionId: 'a', role: 'user', text: 'a0', at: 'x' })).toBe(0)
+    expect(store.appendMessage({ sessionId: 'a', role: 'user', text: 'a1', at: 'x' })).toBe(1)
+    expect(store.appendMessage({ sessionId: 'b', role: 'user', text: 'b0', at: 'x' })).toBe(0)
+    expect(store.appendMessage({ sessionId: 'b', role: 'user', text: 'b1', at: 'x' })).toBe(1)
+    // 回到 a 继续
+    expect(store.appendMessage({ sessionId: 'a', role: 'user', text: 'a2', at: 'x' })).toBe(2)
   })
 
-  it('同一 (sessionId, seq, kind) 重复写入复用编号，不新增', () => {
-    const first = store.insertEvent(ev({ seq: 5, text: '第一次' }), false)
-    const second = store.insertEvent(ev({ seq: 5, text: '第二次' }), false)
+  it('同会话同角色同正文重复写入复用编号', () => {
+    const first = store.appendMessage({ sessionId: 's', role: 'user', text: '重复内容', at: 'x' })
+    const second = store.appendMessage({ sessionId: 's', role: 'user', text: '重复内容', at: 'y' })
     expect(second).toBe(first)
-    expect(store.getEvent('session-a', first)?.text).toBe('第二次')
+    expect(store.count('s')).toBe(1)
   })
 
-  it('同一 seq 的不同 kind 各占一个编号（assistant 正文 + 思考）', () => {
-    const a = store.insertEvent(ev({ seq: 7, kind: 'assistant', text: '正文' }), false)
-    const b = store.insertEvent(ev({ seq: 7, kind: 'reasoning', text: '思考' }), false)
+  it('同正文不同角色各占一个编号', () => {
+    const a = store.appendMessage({ sessionId: 's', role: 'user', text: '同样的话', at: 'x' })
+    const b = store.appendMessage({ sessionId: 's', role: 'assistant', text: '同样的话', at: 'x' })
     expect(a).not.toBe(b)
   })
 
-  it('按 (sessionId, eventNo) 唯一定位事件', () => {
-    store.insertEvent(ev({ sessionId: 'a', seq: 1, text: 'A1' }), false)
-    store.insertEvent(ev({ sessionId: 'b', seq: 1, text: 'B1' }), false)
-    expect(store.getEvent('a', 1)?.text).toBe('A1')
-    expect(store.getEvent('b', 1)?.text).toBe('B1')
+  it('索引范围正确反映最小与最大', () => {
+    for (const t of ['x', 'y', 'z']) store.appendMessage({ sessionId: 's', role: 'user', text: t, at: 'x' })
+    expect(store.indexRange('s')).toEqual({ min: 0, max: 2 })
+  })
+
+  it('空会话无索引范围', () => {
+    expect(store.indexRange('nope')).toBeUndefined()
   })
 })
 
-describe('MemoryStore FTS', () => {
+describe('上下文状态与便签', () => {
   let store: MemoryStore
-  beforeEach(() => {
-    store = new MemoryStore({ path: ':memory:' })
-  })
-  afterEach(() => {
-    store.close()
+  beforeEach(() => { store = new MemoryStore({ path: ':memory:' }) })
+  afterEach(() => { store.close() })
+
+  it('markOutOfContext 只改状态，编号保留', () => {
+    for (const t of ['a', 'b', 'c']) store.appendMessage({ sessionId: 's', role: 'user', text: t, at: 'x' })
+    store.markOutOfContext('s', 0, 1)
+    expect(store.getMessage('s', 0)?.inContext).toBe(false)
+    expect(store.getMessage('s', 1)?.inContext).toBe(false)
+    expect(store.getMessage('s', 2)?.inContext).toBe(true)
+    // 编号没变
+    expect(store.getMessage('s', 0)?.idx).toBe(0)
   })
 
-  it('能搜到中文（逐字分词补偿）', () => {
-    store.insertEvent(ev({ seq: 1, text: '把这件事记成待办，回头再处理' }), false)
-    const hits = keywordSearch(store, '待办', { limit: 10 })
+  it('addTag 追加便签且去重', () => {
+    store.appendMessage({ sessionId: 's', role: 'user', text: '内容', at: 'x' })
+    store.addTag('s', 0, '已提炼')
+    store.addTag('s', 0, '已提炼')
+    expect(store.getMessage('s', 0)?.tags).toEqual(['已提炼'])
+  })
+
+  it('便签不影响正文', () => {
+    store.appendMessage({ sessionId: 's', role: 'user', text: '原文', at: 'x' })
+    store.addTag('s', 0, '标签')
+    expect(store.getMessage('s', 0)?.text).toBe('原文')
+  })
+})
+
+describe('检索', () => {
+  let store: MemoryStore
+  beforeEach(() => { store = new MemoryStore({ path: ':memory:' }) })
+  afterEach(() => { store.close() })
+
+  it('中文能搜到（逐字分词）', () => {
+    store.appendMessage({ sessionId: 's', role: 'user', text: '把这件事记成待办，回头再处理', at: 'x' })
+    const hits = store.searchFts(buildFtsQuery('待办'), 10)
+    expect(hits).toHaveLength(1)
+    expect(hits[0]?.idx).toBe(0)
+  })
+
+  it('思考内容也进 FTS（不再区分类型）', () => {
+    store.appendMessage({ sessionId: 's', role: 'assistant', text: '我在想这个方案是否可行', at: 'x' })
+    const hits = store.searchFts(buildFtsQuery('方案'), 10)
     expect(hits.length).toBeGreaterThan(0)
-    expect(hits[0].eventNo).toBe(1)
   })
 
-  it('思考不进 FTS（决策①）', () => {
-    store.insertEvent(ev({ seq: 1, kind: 'reasoning', text: '这是模型内部思考' }), false)
-    const hits = keywordSearch(store, '内部思考', { limit: 10 })
-    expect(hits).toHaveLength(0)
+  it('限定会话时只返回该会话', () => {
+    store.appendMessage({ sessionId: 'a', role: 'user', text: '共同关键词', at: 'x' })
+    store.appendMessage({ sessionId: 'b', role: 'user', text: '共同关键词', at: 'x' })
+    const hits = store.searchFts(buildFtsQuery('共同关键词'), 10, 'a')
+    expect(hits).toHaveLength(1)
+    expect(hits[0]?.sessionId).toBe('a')
   })
 
-  it('FTS 命中能回链到事件正文', () => {
-    store.insertEvent(ev({ seq: 3, text: '关于登录超时的排查记录' }), false)
-    const hits = keywordSearch(store, '登录', { limit: 10 })
-    const event = store.getRecordByRowId(hits[0].rowId)
-    expect(event?.text).toContain('登录超时')
-  })
-
-  it('相同 sessionId+seq 不同 kind 时 FTS 只索引非 reasoning', () => {
-    store.insertEvent(ev({ seq: 9, kind: 'assistant', text: '可见回复内容' }), false)
-    store.insertEvent(ev({ seq: 9, kind: 'reasoning', text: '不可见思考内容' }), false)
-    expect(keywordSearch(store, '可见回复', { limit: 10 })).toHaveLength(1)
-    expect(keywordSearch(store, '不可见思考', { limit: 10 })).toHaveLength(0)
+  it('已离开上下文的消息仍可检索', () => {
+    store.appendMessage({ sessionId: 's', role: 'user', text: '重要信息', at: 'x' })
+    store.markOutOfContext('s', 0, 0)
+    const hits = store.searchFts(buildFtsQuery('重要信息'), 10)
+    expect(hits).toHaveLength(1)
   })
 })
 
-describe('MemoryStore 水位线与统计', () => {
-  let store: MemoryStore
-  beforeEach(() => {
-    store = new MemoryStore({ path: ':memory:' })
-  })
-  afterEach(() => {
-    store.close()
-  })
-
-  it('水位线可写入并读回', () => {
-    store.setWatermark({
-      sessionId: 'a',
-      lastSeq: 42,
-      indexedAt: '2026-11-15T00:00:00.000Z',
-      eventCount: 100,
-    })
-    expect(store.getWatermark('a')?.lastSeq).toBe(42)
-  })
-
-  it('同一个会话的水位线更新而非新增', () => {
-    store.setWatermark({ sessionId: 'a', lastSeq: 1, indexedAt: 'x', eventCount: 1 })
-    store.setWatermark({ sessionId: 'a', lastSeq: 9, indexedAt: 'y', eventCount: 2 })
-    expect(store.listWatermarks()).toHaveLength(1)
-    expect(store.getWatermark('a')?.lastSeq).toBe(9)
-  })
-
-  it('status 统计事件与各类子集', () => {
-    store.insertEvent(ev({ seq: 1, kind: 'user' }), false)
-    store.insertEvent(ev({ seq: 2, kind: 'reasoning' }), false)
-    store.insertEvent(ev({ seq: 3, kind: 'summary' }), true)
-    const s = store.status()
-    expect(s.sessions).toBe(1)
-    expect(s.events).toBe(3)
-    expect(s.reasoning).toBe(1)
-    expect(s.summaries).toBe(1)
-    expect(s.shadowed).toBe(1)
-  })
-
-  it('列出某会话的事件编号', () => {
-    store.insertEvent(ev({ seq: 1 }), false)
-    store.insertEvent(ev({ seq: 2 }), false)
-    expect(store.listEventNos('session-a')).toEqual([1, 2])
-  })
-})
-
-describe('MemoryStore 持久化', () => {
-  it('文件库能持久化并重开读取', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mem-store-'))
+describe('持久化', () => {
+  it('文件库重开后数据与编号都在', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mem-'))
     try {
-      const dbPath = join(dir, 'nested', 'memory.sqlite')
-      const store = new MemoryStore({ path: dbPath })
-      store.insertEvent(ev({ seq: 1, text: '持久化内容' }), false)
-      store.close()
+      const p = join(dir, 'nested', 'm.sqlite')
+      const s1 = new MemoryStore({ path: p })
+      s1.appendMessage({ sessionId: 's', role: 'user', text: '持久化', at: 'x' })
+      s1.close()
 
-      const reopened = new MemoryStore({ path: dbPath })
-      expect(reopened.getEvent('session-a', 1)?.text).toBe('持久化内容')
-      reopened.close()
+      const s2 = new MemoryStore({ path: p })
+      expect(s2.getMessage('s', 0)?.text).toBe('持久化')
+      expect(s2.indexRange('s')).toEqual({ min: 0, max: 0 })
+      s2.close()
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

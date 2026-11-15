@@ -1,39 +1,20 @@
-// 封存段（segment）的领域类型与文本组装。
+// 提炼段：把一段历史换成一条带槽位的消息。
 //
-// ===========================================================================
-// 概念区分（这是整套设计的地基，不能混）
-// ===========================================================================
+// 用户要求「近几步全量 + 总结」——所以段的内容按阶段变化：
+//   live      <recent-slot> 原文 </recent-slot> + <summary-slot> 总结 </summary-slot>
+//   archived  <summary-slot> 总结 </summary-slot>
 //
-//   **总结（summarize）** —— 主动提炼。保留有效信息，**丢掉噪音但保留否决路径**。
-//       例：模型想了 10 万字，否定了 A/B/C 三个方案，最终选 D。
-//       好的总结是：
-//           否决 A：因为与现有鉴权冲突
-//           否决 B：因为延迟超标
-//           否决 C：因为改动面太大
-//           最终：D
-//       而不是只有「最终：D」。**后者是压缩，不是总结。**
-//
-//   **压缩（compact）** —— 被动腾空间。dsh 自己做，本插件不管。
-//
-// 本文件只负责「总结」的载体与拼装。
-//
-// ===========================================================================
-// 编号与槽位规则
-// ===========================================================================
-//
-//   一个「段」= 一个事件 = 一个会话内编号（eventNo）。
-//   段的内部用标签分槽：
-//
-//       <recent-slot>   近期原文，全量保留   </recent-slot>
-//       <summary-slot>  提炼后的有效信息     </summary-slot>
-//
-//   段随时间的推移降级：近期 → recent 与 summary 并存；更早 → 只剩 summary。
+// 段的覆盖范围用**索引区间**（from_idx … to_idx），不是 seq。
+// 索引是会话内线性的，所以区间是连续的，不会漏。
 
-/** 槽位标签名。 */
+import type DatabaseConstructor from 'better-sqlite3'
+import type { Segment } from '../types.js'
+
+type BetterSqlite3 = ReturnType<typeof DatabaseConstructor>
+
+/** 槽位标签。 */
 export const SLOT_TAGS = {
-  /** 近期全量原文 */
   recent: 'recent-slot',
-  /** 提炼后的有效信息 */
   summary: 'summary-slot',
 } as const
 
@@ -47,111 +28,51 @@ export interface Slot {
 }
 
 /**
- * 段的生命周期阶段。
+ * 把槽位拼成一条正文。
  *
- * - `live`：还在近期窗口内，原文与总结并存。
- * - `archived`：已滑出近期窗口，只剩总结。
- */
-export type SegmentStage = 'live' | 'archived'
-
-/** 一个封存段（内存表示）。 */
-export interface Segment {
-  /** 会话内编号：这是段的唯一标识 */
-  readonly eventNo: number
-  readonly sessionId: string
-  /** 覆盖的 dsh seq 区间（闭区间） */
-  readonly fromSeq: number
-  readonly toSeq: number
-  /** 被遮蔽的每个 surface 节点的 seq（dsh 的 sourceEventSeqs 需要） */
-  readonly shadowedSeqs: readonly number[]
-  /** 提炼后的有效信息 */
-  readonly summary: string
-  /** 近期原文（archived 阶段为空串） */
-  readonly recent: string
-  readonly stage: SegmentStage
-  readonly turn: number
-  readonly at: string
-}
-
-/**
- * 把若干槽位拼成一条消息正文。
- *
- * 空槽位不输出——`archived` 阶段的段只有 summary 一个槽。
- *
- * @param slots - 槽位（顺序即展示顺序）。
- * @returns 带标签的正文；全空时抛错（不能产出空段）。
+ * 空槽跳过；全空抛错（不允许产出空段）。
  */
 export function composeSlottedText(slots: readonly Slot[]): string {
   const used = slots.filter(s => s.text.trim().length > 0)
   if (used.length === 0) throw new Error('composeSlottedText requires at least one non-empty slot')
-  return used
-    .map(({ kind, text }) => `<${SLOT_TAGS[kind]}>\n${text}\n</${SLOT_TAGS[kind]}>`)
-    .join('\n\n')
+  return used.map(({ kind, text }) => `<${SLOT_TAGS[kind]}>\n${text}\n</${SLOT_TAGS[kind]}>`).join('\n\n')
 }
 
-/** 判断一段文本是否已是带槽位的合并体（避免重复包装）。 */
+/** 是否已是带槽位的合并体。 */
 export function isSlottedText(text: string): boolean {
   return text.includes(`<${SLOT_TAGS.recent}>`) || text.includes(`<${SLOT_TAGS.summary}>`)
 }
 
-/**
- * 判断一段内容「是否值得总结」。
- *
- * 用户要求：原文短 → 可以不总结；原文长 → 应该总结。
- * 阈值由本模块把控（调用方可用环境变量覆盖）。
- *
- * 为什么用字符数而不是 token 数：这里只需要一个稳定的量级判断，
- * 精确 token 计数要依赖 tokenizer，代价远大于收益。
- */
-export const SUMMARIZE_THRESHOLD_CHARS = 4000
+/** 长度阈值：≤keep 保持原文；≥summarize 应提炼。 */
 export const KEEP_ORIGINAL_THRESHOLD_CHARS = 1200
+export const SUMMARIZE_THRESHOLD_CHARS = 4000
 
-/** 对一段内容的具体处理建议。 */
+/** 提炼决策。 */
 export type SummarizeDecision =
-  /** 太短，原文直接留，不必总结 */
   | { kind: 'keep-original'; reason: string }
-  /** 中等长度：可总结也可不总结，由模型自己决定 */
   | { kind: 'optional'; reason: string }
-  /** 较长：应当总结 */
   | { kind: 'should-summarize'; reason: string }
 
-/**
- * 根据原文长度给出总结建议。
- *
- * @param chars - 该段原文的字符数。
- * @param thresholds - 可覆盖的阈值（测试与部署调参用）。
- */
+/** 按字符数给出决策。 */
 export function decideSummarize(
   chars: number,
   thresholds: { keep?: number; summarize?: number } = {},
 ): SummarizeDecision {
   const keep = thresholds.keep ?? KEEP_ORIGINAL_THRESHOLD_CHARS
   const sum = thresholds.summarize ?? SUMMARIZE_THRESHOLD_CHARS
-  if (chars <= keep) {
-    return { kind: 'keep-original', reason: `${chars} chars ≤ ${keep}: 原文够短，直接保留` }
-  }
-  if (chars >= sum) {
-    return { kind: 'should-summarize', reason: `${chars} chars ≥ ${sum}: 内容较长，应提炼有效信息` }
-  }
-  return { kind: 'optional', reason: `${chars} chars 介于 ${keep}–${sum}: 由模型自行决定是否提炼` }
+  if (chars <= keep) return { kind: 'keep-original', reason: `${chars} ≤ ${keep}：原文够短，直接保留` }
+  if (chars >= sum) return { kind: 'should-summarize', reason: `${chars} ≥ ${sum}：内容较长，应提炼` }
+  return { kind: 'optional', reason: `${chars} 介于 ${keep}–${sum}：由循环决定` }
 }
 
 /**
- * 构造「请提炼」的 user 提示。
+ * 构造「请提炼」的提示。
  *
- * **关键要求（用户原话）**：这是提炼，不是压缩。
- * 必须保留**否决路径**——哪些方案被否了、为什么；
- * 不能只留最终结论。
- *
- * **且这条提示只出现一次**：它是触发总结的指令，不应该进入后续上下文。
- * 因此调用方负责在总结完成后让它不再回传（由 dsh 的 surface 遮蔽完成）。
- *
- * @param charCount - 被提炼内容的字符数，用于让模型知道规模。
- * @returns 提示文本。
+ * 关键要求：这是提炼，不是压缩——必须保留否决路径。
  */
-export function buildSummarizePrompt(charCount: number): string {
+export function buildSummarizePrompt(chars: number, fromIdx: number, toIdx: number): string {
   return [
-    `你需要提炼下面这段内容的**有效信息**，丢弃噪音。`,
+    `请提炼下面这段内容的**有效信息**，丢弃噪音。`,
     ``,
     `这不是压缩，是提炼。区别在于：`,
     `- 压缩会把一大段变成"最终方案：X"`,
@@ -164,11 +85,105 @@ export function buildSummarizePrompt(charCount: number): string {
     `  最终方案：<结论>`,
     ``,
     `要求：`,
-    `1. 每一处否决都要保留理由——这些理由往往是后续避免重蹈覆辙的关键`,
-    `2. 保留具体的事实性细节（文件路径、数值、错误信息），不要泛化成抽象描述`,
+    `1. 每一处否决都要保留理由`,
+    `2. 保留具体的事实性细节（文件路径、数值、错误信息）`,
     `3. 不要保留过程性的试错（同样的错误重复 N 次只写一次）`,
     `4. 总长度控制在原文的 10%–20%`,
     ``,
-    `待提炼内容共约 ${charCount} 字符。`,
+    `待提炼内容：#${fromIdx} 至 #${toIdx}，共约 ${chars} 字符。`,
   ].join('\n')
+}
+
+/** 段仓储。 */
+export class SegmentStore {
+  constructor(private readonly db: BetterSqlite3) {}
+
+  /** 插入一段，返回段号。 */
+  insert(seg: Omit<Segment, 'segmentNo'>): number {
+    const info = this.db
+      .prepare(
+        `INSERT INTO segment (sessionId, from_idx, to_idx, summary, recent, stage, at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(seg.sessionId, seg.fromIdx, seg.toIdx, seg.summary, seg.recent, seg.stage, seg.at)
+    return Number(info.lastInsertRowid)
+  }
+
+  /** 按段号取。 */
+  get(segmentNo: number): Segment | undefined {
+    const row = this.db.prepare(`SELECT * FROM segment WHERE segment_no = ?`).get(segmentNo) as SegmentRow | undefined
+    return row ? toSegment(row) : undefined
+  }
+
+  /** 该会话的全部段（按 from_idx 升序）。 */
+  list(sessionId: string): Segment[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM segment WHERE sessionId = ? ORDER BY from_idx ASC`)
+      .all(sessionId) as SegmentRow[]
+    return rows.map(toSegment)
+  }
+
+  /** live 阶段的段。 */
+  listLive(sessionId: string): Segment[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM segment WHERE sessionId = ? AND stage = 'live' ORDER BY from_idx ASC`)
+      .all(sessionId) as SegmentRow[]
+    return rows.map(toSegment)
+  }
+
+  /** 找与给定 idx 区间重叠的段。 */
+  findOverlapping(sessionId: string, fromIdx: number, toIdx: number): Segment | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM segment WHERE sessionId = ? AND NOT (to_idx < ? OR from_idx > ?) LIMIT 1`,
+      )
+      .get(sessionId, fromIdx, toIdx) as SegmentRow | undefined
+    return row ? toSegment(row) : undefined
+  }
+
+  /** 已被段覆盖的 idx 集合。 */
+  coveredIdxs(sessionId: string): Set<number> {
+    const covered = new Set<number>()
+    for (const seg of this.list(sessionId)) {
+      for (let i = seg.fromIdx; i <= seg.toIdx; i += 1) covered.add(i)
+    }
+    return covered
+  }
+
+  /** 降级为 archived（清空 recent，保留 summary）。 */
+  archive(segmentNo: number): boolean {
+    return this.db.prepare(`UPDATE segment SET stage = 'archived', recent = '' WHERE segment_no = ?`).run(segmentNo).changes > 0
+  }
+
+  /** 统计。 */
+  stats(sessionId?: string): { total: number; live: number } {
+    const row = sessionId
+      ? this.db.prepare(`SELECT COUNT(*) AS t, SUM(stage='live') AS l FROM segment WHERE sessionId = ?`).get(sessionId) as { t: number; l: number | null }
+      : this.db.prepare(`SELECT COUNT(*) AS t, SUM(stage='live') AS l FROM segment`).get() as { t: number; l: number | null }
+    return { total: row.t, live: row.l ?? 0 }
+  }
+}
+
+interface SegmentRow {
+  segment_no: number
+  sessionId: string
+  from_idx: number
+  to_idx: number
+  summary: string
+  recent: string
+  stage: string
+  at: string
+}
+
+function toSegment(row: SegmentRow): Segment {
+  return {
+    segmentNo: row.segment_no,
+    sessionId: row.sessionId,
+    fromIdx: row.from_idx,
+    toIdx: row.to_idx,
+    summary: row.summary,
+    recent: row.recent,
+    stage: row.stage === 'live' ? 'live' : 'archived',
+    at: row.at,
+  }
 }

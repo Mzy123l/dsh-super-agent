@@ -1,217 +1,193 @@
-// 向量检索层（规格 §4.2）
+// 向量检索：本地实现，向量存 SQLite。
 //
-// VectorStore / EmbeddingProvider 接口定义在 types.ts（注入式，插件不绑定具体模型）。
-// 本文件提供两个理论阶段实现：
-// - NoopVectorStore：空实现，向量检索恒返回空（hybrid 自动退化为纯关键词）
-// - OpenAICompatVectorStore：任何 OpenAI 兼容 embedding 端点（key 从环境变量读）
+// 用户要求「剩下没做的全部做了」——原来的 NoopVectorStore 是空实现，
+// 这里补一个能真跑的：余弦相似度 + 暴力扫描。
 //
-// reasoning 与 records 的向量以 id 区分：
-//   'r:<sessionId>:<seq>:<kind>' —— records 表
-//   'n:<sessionId>:<seq>'        —— reasoning 表（决策①：只向量化）
+// 为什么暴力扫描而不是 ANN：
+// 单个会话的消息量是几百到几千条，暴力扫描足够快（几十毫秒），
+// 引入 HNSW 之类会带来索引维护复杂度，收益不成比例。
 
+import type DatabaseConstructor from 'better-sqlite3'
 import type { EmbeddingProvider, VectorRecordId, VectorStore } from '../types.js'
-import type { MemoryStore } from '../store/sqlite.js'
-import type { MemoryRecordResult, ReasoningHit } from '../types.js'
 
-/** 空实现：理论阶段的默认值。写入丢弃，检索返回空。 */
-export class NoopVectorStore implements VectorStore {
-  async upsert(_id: VectorRecordId, _embedding: number[]): Promise<void> {}
-  async search(_embedding: number[], _k: number): Promise<Array<{ id: VectorRecordId; score: number }>> {
-    return []
-  }
-  count(): number {
-    return 0
-  }
-  async clear(): Promise<void> {}
+type BetterSqlite3 = ReturnType<typeof DatabaseConstructor>
+
+/** 一条存储的向量。 */
+interface VectorRow {
+  row_id: number
+  dims: number
+  vec: string
 }
 
 /**
- * OpenAI 兼容 embedding 端点实现。
- * 环境变量：MEMORY_EMBEDDING_API_KEY、MEMORY_EMBEDDING_BASE_URL、MEMORY_EMBEDDING_MODEL。
+ * 基于 SQLite 的本地向量存储。
+ *
+ * 写入时按 `message.row_id` 关联；检索时拉出全部向量暴力算余弦相似度。
  */
-export class OpenAICompatVectorStore implements VectorStore {
-  private vectors = new Map<VectorRecordId, number[]>()
+export class SqliteVectorStore implements VectorStore {
+  constructor(private readonly db: BetterSqlite3) {}
 
-  constructor(
-    private provider: EmbeddingProvider,
-    private maxChars = 2000,
-  ) {}
-
+  /**
+   * 写入一条向量。
+   *
+   * @param id - `<sessionId>#<idx>` 形式。
+   * @param embedding - 向量。
+   */
   async upsert(id: VectorRecordId, embedding: number[]): Promise<void> {
-    this.vectors.set(id, embedding)
+    const rowId = this.resolveRowId(id)
+    if (rowId === undefined) return
+    this.db
+      .prepare(
+        `INSERT INTO message_vector (row_id, dims, vec) VALUES (?, ?, ?)
+         ON CONFLICT (row_id) DO UPDATE SET dims = excluded.dims, vec = excluded.vec`,
+      )
+      .run(rowId, embedding.length, JSON.stringify(embedding))
   }
 
+  /**
+   * 检索 top-k。
+   *
+   * @param embedding - 查询向量。
+   * @param k - 返回条数。
+   * @returns 按相似度降序的命中。
+   */
   async search(embedding: number[], k: number): Promise<Array<{ id: VectorRecordId; score: number }>> {
-    // 暴力余弦相似度 top-k（理论阶段质量优先；量级大时换 sqlite-vec）
+    const rows = this.db.prepare(`SELECT row_id, dims, vec FROM message_vector`).all() as VectorRow[]
+    if (rows.length === 0) return []
+
     const scored: Array<{ id: VectorRecordId; score: number }> = []
-    for (const [id, vec] of this.vectors) {
-      scored.push({ id, score: cosine(embedding, vec ?? []) })
+    for (const row of rows) {
+      if (row.dims !== embedding.length) continue
+      const vec = safeParse(row.vec)
+      if (!vec) continue
+      const score = cosine(embedding, vec)
+      const id = this.resolveId(row.row_id)
+      if (id === undefined) continue
+      scored.push({ id, score })
     }
     scored.sort((a, b) => b.score - a.score)
     return scored.slice(0, k)
   }
 
+  /** 已存向量条数。 */
   count(): number {
-    return this.vectors.size
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM message_vector`).get() as { n: number }).n
   }
 
+  /** 清空。 */
   async clear(): Promise<void> {
-    this.vectors.clear()
+    this.db.prepare(`DELETE FROM message_vector`).run()
   }
 
-  /** 生成文本 embedding（超长截断） */
-  async embed(text: string): Promise<number[]> {
-    const clipped = text.length > this.maxChars ? text.slice(0, this.maxChars) : text
-    return this.provider.embed(clipped)
+  /** `<sessionId>#<idx>` → message.row_id */
+  private resolveRowId(id: VectorRecordId): number | undefined {
+    const hash = id.lastIndexOf('#')
+    if (hash <= 0) return undefined
+    const sessionId = id.slice(0, hash)
+    const idx = Number(id.slice(hash + 1))
+    if (!Number.isInteger(idx)) return undefined
+    const row = this.db
+      .prepare(`SELECT row_id FROM message WHERE sessionId = ? AND idx = ?`)
+      .get(sessionId, idx) as { row_id: number } | undefined
+    return row?.row_id
+  }
+
+  /** message.row_id → `<sessionId>#<idx>` */
+  private resolveId(rowId: number): VectorRecordId | undefined {
+    const row = this.db
+      .prepare(`SELECT sessionId, idx FROM message WHERE row_id = ?`)
+      .get(rowId) as { sessionId: string; idx: number } | undefined
+    return row ? `${row.sessionId}#${row.idx}` : undefined
   }
 }
 
-/** 余弦相似度（零向量返回 0） */
-export function cosine(a: number[], b: number[]): number {
-  if (a.length !== b.length || a.length === 0) return 0
+/** 余弦相似度。 */
+export function cosine(a: readonly number[], b: readonly number[]): number {
   let dot = 0
-  let normA = 0
-  let normB = 0
-  for (let i = 0; i < a.length; i++) {
-    const ai = a[i] as number
-    const bi = b[i] as number
-    dot += ai * bi
-    normA += ai * ai
-    normB += bi * bi
+  let na = 0
+  let nb = 0
+  const n = Math.min(a.length, b.length)
+  for (let i = 0; i < n; i += 1) {
+    const x = a[i] as number
+    const y = b[i] as number
+    dot += x * y
+    na += x * x
+    nb += y * y
   }
-  if (normA === 0 || normB === 0) return 0
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB))
+  if (na === 0 || nb === 0) return 0
+  return dot / (Math.sqrt(na) * Math.sqrt(nb))
 }
 
-/** OpenAI 兼容 /v1/embeddings 的 HTTP 实现 */
-export class OpenAICompatEmbedding implements EmbeddingProvider {
-  constructor(
-    private apiKey: string,
-    private baseUrl: string,
-    private model: string,
-  ) {}
-
-  static fromEnv(): OpenAICompatEmbedding | undefined {
-    const apiKey = process.env['MEMORY_EMBEDDING_API_KEY']
-    const baseUrl = process.env['MEMORY_EMBEDDING_BASE_URL'] ?? 'https://api.openai.com/v1'
-    const model = process.env['MEMORY_EMBEDDING_MODEL']
-    if (!apiKey || !model) return undefined
-    return new OpenAICompatEmbedding(apiKey, baseUrl, model)
+/** 安全解析 JSON 数组。 */
+function safeParse(raw: string): number[] | undefined {
+  try {
+    const v = JSON.parse(raw)
+    return Array.isArray(v) && v.every(n => typeof n === 'number') ? (v as number[]) : undefined
+  } catch {
+    return undefined
   }
-
-  async embed(text: string): Promise<number[]> {
-    const response = await fetch(`${this.baseUrl}/embeddings`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify({ model: this.model, input: text }),
-    })
-    if (!response.ok) {
-      throw new Error(`embedding endpoint returned ${response.status}`)
-    }
-    const json = (await response.json()) as { data?: Array<{ embedding?: number[] }> }
-    const embedding = json.data?.[0]?.embedding
-    if (!Array.isArray(embedding)) {
-      throw new Error('embedding endpoint returned no embedding')
-    }
-    return embedding
-  }
-}
-
-/** 向量命中的回链结果（kind=reasoning 时标记 'reasoning'，调用方据此区分思考与事实） */
-export interface VectorHitResult {
-  id: VectorRecordId
-  score: number
-  kind: 'reasoning' | MemoryRecordResult['kind']
-  record?: MemoryRecordResult
-  reasoning?: ReasoningHit
 }
 
 /**
- * 解析向量 id 并回链正文。
+ * 哈希式本地 embedding（无需外部服务）。
  *
- * 向量 id 沿用事件编号体系：`<sessionId>#<eventNo>`。
- * 一个编号只对应一个事件——不再区分 r:/n: 前缀，
- * 因为 reasoning 也是一个普通事件（只是不进 FTS）。
+ * 这是**兜底实现**：把文本切成 token，用 token 的哈希映射到一个固定维度的
+ * 稀疏向量上。它捕捉的是「词重合」而不是语义，但比 Noop 强——
+ * 至少思考内容能被搜到了。
  *
- * 为兼容旧索引，保留了 `r:` / `n:` 两种历史形态的解析。
+ * 需要真语义相似度时，注入 OpenAICompatEmbedding 覆盖它。
  */
-export function resolveVectorHits(
-  store: MemoryStore,
-  hits: Array<{ id: VectorRecordId; score: number }>,
-): VectorHitResult[] {
-  const results: VectorHitResult[] = []
-  for (const hit of hits) {
-    const resolved = resolveOne(store, hit)
-    if (resolved) results.push(resolved)
+export class HashingEmbedding implements EmbeddingProvider {
+  private readonly dims: number
+
+  constructor(dims = 512) {
+    this.dims = dims
   }
-  return results
+
+  async embed(text: string): Promise<number[]> {
+    const vec = new Array<number>(this.dims).fill(0)
+    const tokens = tokenize(text)
+    for (const token of tokens) {
+      const h = hash(token)
+      const slot = h % this.dims
+      // 用符号散列减少碰撞偏置
+      vec[slot] = (vec[slot] as number) + (h & 1 ? 1 : -1)
+    }
+    // L2 归一化
+    let norm = 0
+    for (const v of vec) norm += v * v
+    if (norm > 0) {
+      const inv = 1 / Math.sqrt(norm)
+      for (let i = 0; i < vec.length; i += 1) vec[i] = (vec[i] as number) * inv
+    }
+    return vec
+  }
 }
 
-/** 解析单个向量命中。 */
-function resolveOne(
-  store: MemoryStore,
-  hit: { id: VectorRecordId; score: number },
-): VectorHitResult | undefined {
-  // 新格式：<sessionId>#<eventNo>
-  if (!hit.id.startsWith('r:') && !hit.id.startsWith('n:')) {
-    const hash = hit.id.lastIndexOf('#')
-    if (hash < 0) return undefined
-    const sessionId = hit.id.slice(0, hash)
-    const eventNo = Number(hit.id.slice(hash + 1))
-    if (!Number.isInteger(eventNo)) return undefined
-    const event = store.getEvent(sessionId, eventNo)
-    if (!event) return undefined
-    if (event.kind === 'reasoning') {
-      return {
-        id: hit.id,
-        score: hit.score,
-        kind: 'reasoning',
-        reasoning: { ...event, score: hit.score },
-      }
-    }
-    return {
-      id: hit.id,
-      score: hit.score,
-      kind: event.kind,
-      record: { ...event, score: hit.score },
+/** 切 token：CJK 逐字，拉丁按词。 */
+export function tokenize(text: string): string[] {
+  const out: string[] = []
+  let latin = ''
+  for (const ch of text) {
+    if (/[\u4e00-\u9fff\u3400-\u4dbf]/.test(ch)) {
+      if (latin) { out.push(latin); latin = '' }
+      out.push(ch)
+    } else if (/[a-zA-Z0-9_]/.test(ch)) {
+      latin += ch.toLowerCase()
+    } else {
+      if (latin) { out.push(latin); latin = '' }
     }
   }
+  if (latin) out.push(latin)
+  return out
+}
 
-  // 历史格式：n:<sessionId>:<seq>
-  if (hit.id.startsWith('n:')) {
-    const rest = hit.id.slice(2)
-    const idx = rest.lastIndexOf(':')
-    if (idx < 0) return undefined
-    const sessionId = rest.slice(0, idx)
-    const seq = Number(rest.slice(idx + 1))
-    const reasoning = store.getReasoning(sessionId, seq)
-    if (!reasoning) return undefined
-    return {
-      id: hit.id,
-      score: hit.score,
-      kind: 'reasoning',
-      reasoning: { ...reasoning, score: hit.score },
-    }
+/** FNV-1a 32 位哈希。 */
+function hash(s: string): number {
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i += 1) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
   }
-
-  // 历史格式：r:<sessionId>:<seq>:<kind>
-  const rest = hit.id.slice(2)
-  const firstColon = rest.indexOf(':')
-  if (firstColon < 0) return undefined
-  const secondColon = rest.indexOf(':', firstColon + 1)
-  if (secondColon < 0) return undefined
-  const sessionId = rest.slice(0, firstColon)
-  const seq = Number(rest.slice(firstColon + 1, secondColon))
-  const kind = rest.slice(secondColon + 1)
-  const record = store.getRecord(sessionId, seq, kind)
-  if (!record) return undefined
-  return {
-    id: hit.id,
-    score: hit.score,
-    kind: record.kind,
-    record: { ...record, score: hit.score },
-  }
+  return h
 }

@@ -1,25 +1,15 @@
-// CLI：index / search / status（规格 §5.2）
+#!/usr/bin/env node
+// CLI：手动索引、检索、状态、区间查看。
 //
-// 用法：
-//   memory-plugin index [--sessions <dir>] [--data <dir>] [--session <id>] [--all]
-//   memory-plugin search "待办" [--mode hybrid] [--limit 20] [--json] [--order time]
-//   memory-plugin status [--data <dir>]
+// 注意：**没有自动索引**。索引只能由人显式发起。
 
-import { MemoryStore } from './store/sqlite.js'
-import { SegmentStore } from './seal/store.js'
-import { applyArchive } from './seal/lifecycle.js'
-import { computeSpans, coveredSeqs } from './seal/spans.js'
-import { indexAll, discoverSessionFiles } from './ingest/indexer.js'
-import { search } from './search/index.js'
-import { NoopVectorStore, OpenAICompatEmbedding, OpenAICompatVectorStore } from './search/vector.js'
-import type { IndexerConfig } from './types.js'
 import { join } from 'node:path'
-import { homedir } from 'node:os'
-
-/** 默认会话目录（只读）：~/.dsh/sessions */
-function defaultSessionsDir(): string {
-  return join(homedir(), '.dsh', 'sessions')
-}
+import { MemoryStore } from './store/sqlite.js'
+import { SegmentStore } from './seal/types.js'
+import { search } from './search/index.js'
+import { SqliteVectorStore, HashingEmbedding } from './search/vector.js'
+import { computeSpans, archiveDue } from './loop/engine.js'
+import type { SearchMode } from './types.js'
 
 interface CliArgs {
   command: string
@@ -37,7 +27,6 @@ function parseArgs(argv: string[]): CliArgs {
     if (arg.startsWith('--')) {
       const name = arg.slice(2)
       const next = argv[i + 1]
-      // 布尔 flag（无值或下一个也是 -- 开头）
       if (next === undefined || next.startsWith('--')) {
         flags.set(name, 'true')
         i += 1
@@ -56,225 +45,148 @@ function parseArgs(argv: string[]): CliArgs {
   return { command, flags, positional }
 }
 
-function buildConfig(flags: Map<string, string>): IndexerConfig {
-  const dataDir = flags.get('data') ?? join(process.cwd(), 'data')
-  const sessionsDir = flags.get('sessions') ?? defaultSessionsDir()
-  const config: IndexerConfig = { sessionsDir, dataDir }
-
-  // 向量：环境变量齐全时用 OpenAI 兼容端点，否则 Noop（理论阶段默认）
-  const embedding = OpenAICompatEmbedding.fromEnv()
-  if (embedding && flags.get('vector') !== 'false') {
-    config.embedding = embedding
-    config.vectorStore = new OpenAICompatVectorStore(embedding)
-  } else {
-    config.vectorStore = new NoopVectorStore()
-  }
-  return config
+function openStore(args: CliArgs): MemoryStore {
+  const dataDir = args.flags.get('data') ?? './data'
+  return new MemoryStore({ path: join(dataDir, 'memory.sqlite') })
 }
 
-function formatRecord(
-  kind: string,
-  sessionId: string,
-  seq: number,
-  at: string,
-  turn: number | undefined,
-  shadowed: boolean,
-  score: number | undefined,
-  text: string,
-): string {
-  const turnPart = turn !== undefined ? ` turn=${turn}` : ''
-  const scorePart = score !== undefined ? ` score=${score.toFixed(4)}` : ''
-  const flags = [shadowed ? 'shadowed' : '', turnPart, scorePart].filter(Boolean).join('')
-  const head = `[${kind}] ${sessionId.slice(0, 8)} seq=${seq} at=${at}${flags ? ' ' + flags : ''}`
-  const body = text.replace(/\s+/g, ' ').slice(0, 120)
-  return `${head}\n  ${body}`
+function usage(): void {
+  console.log(`memory-plugin — DSH 会话记忆插件
+
+用法：
+  memory-plugin search "query" [--mode keyword|hybrid] [--limit 8] [--session <id>] [--data <dir>]
+  memory-plugin get --session <id> --idx N [--data <dir>]      取某条消息的全量
+  memory-plugin spans --session <id> [--keep 20] [--data <dir>] 列出可提炼区间
+  memory-plugin archive --session <id> --keep 20 [--data <dir>] 降级滑出窗口的段
+  memory-plugin status [--data <dir>]
+
+说明：
+  - 索引按会话线性维护，0 = 第一个 user prompt
+  - 检索命中返回该条消息的**全量**，不摘要
+  - 便签由程序内部维护，只做展示`)
 }
 
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2))
+  if (!args.command) {
+    usage()
+    return args.command ? 1 : 0
+  }
 
   switch (args.command) {
-    case 'index': {
-      const config = buildConfig(args.flags)
-      const specific = args.flags.get('session')
-      if (specific) {
-        // 单会话索引：定位到该会话文件
-        const files = discoverSessionFiles(config.sessionsDir).filter((f) => f.sessionId === specific)
-        if (files.length === 0) {
-          console.error(`session not found: ${specific}`)
-          return 1
-        }
-        const store = new MemoryStore({ path: join(config.dataDir, 'memory.sqlite') })
-        const { report } = await import('./ingest/indexer.js').then(async (m) => {
-          const r = {
-            sessionsScanned: files.length,
-            sessionsIndexed: 0,
-            sessionsSkipped: 0,
-            recordsWritten: 0,
-            reasoningWritten: 0,
-            vectorsWritten: 0,
-            badFrames: 0,
-            parseErrors: 0,
-            durationMs: 0,
-          }
-          for (const file of files) await m.indexSession(store, config.vectorStore!, config, file, r)
-          store.setMeta('lastIndexedAt', new Date().toISOString())
-          return { report: r }
-        })
-        console.log(JSON.stringify(report, null, 2))
-        store.close()
-        return 0
+    case 'search': {
+      const query = args.positional[0]
+      if (!query) {
+        console.error('用法：memory-plugin search "query"')
+        return 2
       }
-      const { store, report } = await indexAll(config)
-      console.log(JSON.stringify(report, null, 2))
+      const store = openStore(args)
+      const vectorStore = new SqliteVectorStore(store.raw)
+      const embedding = new HashingEmbedding()
+      const mode: SearchMode = args.flags.get('mode') === 'hybrid' ? 'hybrid' : 'keyword'
+      const hits = await search(
+        { store, vectorStore, embedding },
+        query,
+        {
+          mode,
+          limit: Number(args.flags.get('limit') ?? 8),
+          sessionId: args.flags.get('session') ?? undefined,
+        },
+      )
+      if (args.flags.get('json') === 'true') {
+        console.log(JSON.stringify(hits, null, 2))
+      } else {
+        console.log(`命中 ${hits.length} 条：`)
+        for (const h of hits) {
+          const tags = h.tags.length > 0 ? ` [${h.tags.join(',')}]` : ''
+          const flag = h.inContext ? '' : ' (已离开上下文)'
+          console.log(`\n#${h.idx} ${h.role}${tags}${flag}`)
+          console.log(h.text.length > 400 ? `${h.text.slice(0, 400)}…` : h.text)
+        }
+      }
       store.close()
       return 0
     }
 
-    case 'search': {
-      const query = args.positional[0]
-      if (!query) {
-        console.error('usage: memory-plugin search "query" [--mode hybrid] [--limit 20] [--json]')
+    case 'get': {
+      const sessionId = args.flags.get('session')
+      const idx = Number(args.flags.get('idx') ?? -1)
+      if (!sessionId || idx < 0) {
+        console.error('用法：memory-plugin get --session <id> --idx N')
+        return 2
+      }
+      const store = openStore(args)
+      const msg = store.getMessage(sessionId, idx)
+      if (!msg) {
+        console.error(`未找到 #${idx}`)
+        store.close()
         return 1
       }
-      const config = buildConfig(args.flags)
-      const store = new MemoryStore({ path: join(config.dataDir, 'memory.sqlite') })
-      const mode = args.flags.get('mode') === 'hybrid' ? 'hybrid' : 'keyword'
-      const limit = Number(args.flags.get('limit') ?? 20)
-      const order = args.flags.get('order') === 'time' ? 'time' : 'rank'
-      const results = await search(
-        { store, vectorStore: config.vectorStore, embedding: config.embedding as never },
-        query,
-        { mode, limit, order },
-      )
-      if (args.flags.get('json') === 'true') {
-        console.log(JSON.stringify(results, null, 2))
-      } else {
-        for (const r of results) {
-          if (r.isReasoning) {
-            const hit = r.payload as import('./types.js').ReasoningHit
-            console.log(
-              formatRecord('reasoning', hit.sessionId, hit.seq, hit.at, hit.turn, false, r.score, hit.text),
-            )
-          } else {
-            const rec = r.payload as import('./types.js').MemoryRecordResult
-            console.log(
-              formatRecord(rec.kind, rec.sessionId, rec.seq, rec.at, rec.turn, rec.shadowed, r.score, rec.text),
-            )
-          }
-          console.log('')
-        }
-        console.log(`(${results.length} hits, mode=${mode})`)
-      }
+      console.log(`#${msg.idx} ${msg.role} · ${msg.at}${msg.inContext ? '' : ' · 已离开上下文'}`)
+      if (msg.tags.length > 0) console.log(`便签：${msg.tags.join(', ')}`)
+      console.log('')
+      console.log(msg.text)
       store.close()
       return 0
     }
 
     case 'spans': {
-      // 列出某会话可总结的区间（只读）
-      const config = buildConfig(args.flags)
       const sessionId = args.flags.get('session')
       if (!sessionId) {
         console.error('用法：memory-plugin spans --session <id>')
         return 2
       }
-      const store = new MemoryStore({ path: join(config.dataDir, 'memory.sqlite') })
+      const store = openStore(args)
       const segments = new SegmentStore(store.raw)
-      const covered = coveredSeqs(segments, sessionId)
-      const events = store.listEvents(sessionId, undefined, 100000, 0).map(e => ({
-        seq: e.seq,
-        turn: e.turn,
-        chars: e.text.length,
-      }))
-      const latestTurn = events.reduce((m, e) => Math.max(m, e.turn ?? 0), 0)
-      const keepTurns = Number(args.flags.get('keep') ?? 3)
-      const spans = computeSpans(events, covered, latestTurn, keepTurns)
-      if (args.flags.get('json') === 'true') {
-        console.log(JSON.stringify({ sessionId, latestTurn, keepTurns, spans }, null, 2))
-      } else {
-        console.log(`session ${sessionId} · latest turn ${latestTurn} · keep ${keepTurns}`)
-        console.log(`可总结区间：${spans.length} 个`)
-        for (const s of spans) {
-          console.log(
-            `  turn ${s.fromTurn}  seq ${s.fromSeq}–${s.toSeq}  ${s.eventCount} 条  ${s.chars} 字符  ${s.recommendation}`,
-          )
-        }
+      const keep = Number(args.flags.get('keep') ?? 20)
+      const range = store.indexRange(sessionId)
+      const spans = computeSpans(store, segments, sessionId)
+      console.log(`会话 ${sessionId}`)
+      console.log(`索引范围：#${range?.min ?? '-'} … #${range?.max ?? '-'}（共 ${store.count(sessionId)} 条）`)
+      console.log(`保留最近 ${keep} 条原文，可提炼区间 ${spans.length} 个：`)
+      for (const s of spans) {
+        console.log(`  #${s.fromIdx}–#${s.toIdx}  ${s.count} 条  ${s.chars} 字符`)
       }
       store.close()
       return 0
     }
 
     case 'archive': {
-      // 把滑出近期窗口的段降级为「只留总结」
-      const config = buildConfig(args.flags)
       const sessionId = args.flags.get('session')
       if (!sessionId) {
-        console.error('用法：memory-plugin archive --session <id> [--keep 3]')
+        console.error('用法：memory-plugin archive --session <id> --keep 20')
         return 2
       }
-      const store = new MemoryStore({ path: join(config.dataDir, 'memory.sqlite') })
+      const store = openStore(args)
       const segments = new SegmentStore(store.raw)
-      const latestTurn = Number(args.flags.get('latest') ?? 0)
-      const keepTurns = Number(args.flags.get('keep') ?? 3)
-      const archived = applyArchive(segments, sessionId, latestTurn, keepTurns)
-      console.log(`已降级 ${archived} 个段（session=${sessionId} latestTurn=${latestTurn} keep=${keepTurns}）`)
+      const keep = Number(args.flags.get('keep') ?? 20)
+      const range = store.indexRange(sessionId)
+      const n = range ? archiveDue(segments, sessionId, keep, range.max) : 0
+      console.log(`已降级 ${n} 个段（会话 ${sessionId}，保留最近 ${keep} 条）`)
       store.close()
       return 0
     }
 
     case 'status': {
-      const config = buildConfig(args.flags)
-      const store = new MemoryStore({ path: join(config.dataDir, 'memory.sqlite') })
-      const vectorStore = config.vectorStore ?? new NoopVectorStore()
-      const status = store.status()
-      console.log(`sessions indexed : ${status.sessions}`)
-      console.log(`events           : ${status.events}`)
-      console.log(`reasoning        : ${status.reasoning}`)
-      console.log(`sealed segments  : ${status.sealed}`)
-      console.log(`summaries        : ${status.summaries}`)
-      console.log(`shadowed records : ${status.shadowed}`)
-      console.log(`last indexed at  : ${status.lastIndexedAt ?? '(never)'}`)
+      const store = openStore(args)
+      const s = store.status()
+      console.log(`sessions        : ${s.sessions}`)
+      console.log(`messages        : ${s.messages}`)
+      console.log(`in context      : ${s.inContext}`)
+      console.log(`segments        : ${s.segments}（live ${s.liveSegments}）`)
+      console.log(`last indexed at : ${s.lastIndexedAt ?? '(never)'}`)
       store.close()
       return 0
     }
 
-    case 'serve': {
-      // HTTP 只读 API（规格 §5.1；默认 127.0.0.1:7800）
-      const config = buildConfig(args.flags)
-      const store = new MemoryStore({ path: join(config.dataDir, 'memory.sqlite') })
-      const { startApiServer } = await import('./api/server.js')
-      const server = startApiServer({
-        store,
-        config,
-        vectorStore: config.vectorStore,
-        embedding: config.embedding as never,
-        port: Number(args.flags.get('port') ?? 7800),
-      })
-      const address = server.address()
-      const port = typeof address === 'object' && address ? address.port : 7800
-      console.log(`memory-plugin API listening on http://127.0.0.1:${port} (read-only + POST /index)`)
-      return 0
-    }
-
     default:
-      console.log(`memory-plugin — DSH 会话记忆插件（纯理论实现）
-
-用法：
-  memory-plugin index [--sessions <dir>] [--data <dir>] [--session <id>] [--all]
-  memory-plugin search "query" [--mode keyword|hybrid] [--limit 20] [--order rank|time] [--json]
-  memory-plugin status [--data <dir>]
-  memory-plugin serve [--port 7800] [--data <dir>]
-  memory-plugin spans --session <id> [--keep 3]       列出可总结的区间（只读）
-  memory-plugin archive --session <id> --latest N [--keep 3]  降级滑出窗口的段
-
-说明：
-  - 会话目录只读；索引数据写入 --data（默认 ./data）
-  - 向量化默认关闭（NoopVectorStore）；设置 MEMORY_EMBEDDING_API_KEY/
-    MEMORY_EMBEDDING_BASE_URL/MEMORY_EMBEDDING_MODEL 后 hybrid 可用`)
-      return args.command ? 1 : 0
+      console.error(`未知命令：${args.command}`)
+      usage()
+      return 2
   }
 }
 
-main().then((code) => {
-  process.exitCode = code
+main().then(code => process.exit(code)).catch(error => {
+  console.error(error)
+  process.exit(1)
 })

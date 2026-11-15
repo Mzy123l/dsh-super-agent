@@ -1,77 +1,74 @@
-// 待注入状态（awaiting）的持久化。
+// 等待提炼的状态（每会话最多一条）。
 //
-// 为什么需要持久化而不是放内存：模型回复可能跨进程重启，
-// 重启后要能接着收割，否则提示注入了却没收到结果，历史就会卡住。
+// 持久化而非放内存：模型回复可能跨进程重启，重启后要能接着收割。
 
 import type DatabaseConstructor from 'better-sqlite3'
 
 type BetterSqlite3 = ReturnType<typeof DatabaseConstructor>
 
-/** 等待提炼结果的状态。 */
+/** 等待提炼的状态。 */
 export interface PendingInject {
   readonly sessionId: string
-  /** 待提炼区间的起止 seq */
-  readonly fromSeq: number
-  readonly toSeq: number
-  /** 区间所在轮次 */
-  readonly turn: number
-  /** 注入的提示原文（用于诊断） */
+  /** 待提炼的索引区间 */
+  readonly fromIdx: number
+  readonly toIdx: number
   readonly promptText: string
   readonly createdAt: string
 }
 
-/** 建表（幂等）。 */
-const CREATE_PENDING = `
-CREATE TABLE IF NOT EXISTS pending_inject (
-  sessionId   TEXT PRIMARY KEY,
-  fromSeq     INTEGER NOT NULL,
-  toSeq       INTEGER NOT NULL,
-  turn        INTEGER NOT NULL,
-  promptText  TEXT NOT NULL,
-  createdAt   TEXT NOT NULL
-);
-`
-
-/** 待注入状态仓储：每个会话最多一条（同一时刻只安排一次提炼）。 */
+/** 待注入状态仓储。 */
 export class PendingStore {
-  constructor(private readonly db: BetterSqlite3) {
-    this.db.exec(CREATE_PENDING)
-  }
+  constructor(private readonly db: BetterSqlite3) {}
 
-  /** 读取该会话的等待状态。 */
   getAwaiting(sessionId: string): PendingInject | undefined {
     const row = this.db
       .prepare(`SELECT * FROM pending_inject WHERE sessionId = ?`)
       .get(sessionId) as
-      | { sessionId: string; fromSeq: number; toSeq: number; turn: number; promptText: string; createdAt: string }
+      | { sessionId: string; from_idx: number; to_idx: number; promptText: string; createdAt: string }
       | undefined
-    return row ? { ...row } : undefined
+    if (!row) return undefined
+    return {
+      sessionId: row.sessionId,
+      fromIdx: row.from_idx,
+      toIdx: row.to_idx,
+      promptText: row.promptText,
+      createdAt: row.createdAt,
+    }
   }
 
-  /** 标记为等待吸收。覆盖旧值（同一会话只保留最新一次安排）。 */
   markAwaiting(p: PendingInject): void {
     this.db
       .prepare(
-        `INSERT INTO pending_inject (sessionId, fromSeq, toSeq, turn, promptText, createdAt)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO pending_inject (sessionId, from_idx, to_idx, promptText, createdAt)
+         VALUES (?, ?, ?, ?, ?)
          ON CONFLICT (sessionId) DO UPDATE SET
-           fromSeq = excluded.fromSeq, toSeq = excluded.toSeq, turn = excluded.turn,
+           from_idx = excluded.from_idx, to_idx = excluded.to_idx,
            promptText = excluded.promptText, createdAt = excluded.createdAt`,
       )
-      .run(p.sessionId, p.fromSeq, p.toSeq, p.turn, p.promptText, p.createdAt)
+      .run(p.sessionId, p.fromIdx, p.toIdx, p.promptText, p.createdAt)
   }
 
-  /** 清除该会话的等待状态。 */
   clear(sessionId: string): void {
     this.db.prepare(`DELETE FROM pending_inject WHERE sessionId = ?`).run(sessionId)
   }
 
-  /** 列出全部等待（诊断用）。 */
   list(): PendingInject[] {
-    return this.db.prepare(`SELECT * FROM pending_inject ORDER BY createdAt ASC`).all() as PendingInject[]
+    const rows = this.db.prepare(`SELECT * FROM pending_inject`).all() as Array<{
+      sessionId: string
+      from_idx: number
+      to_idx: number
+      promptText: string
+      createdAt: string
+    }>
+    return rows.map(r => ({
+      sessionId: r.sessionId,
+      fromIdx: r.from_idx,
+      toIdx: r.to_idx,
+      promptText: r.promptText,
+      createdAt: r.createdAt,
+    }))
   }
 
-  /** 统计。 */
   count(): number {
     return (this.db.prepare(`SELECT COUNT(*) AS n FROM pending_inject`).get() as { n: number }).n
   }

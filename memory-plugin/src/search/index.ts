@@ -1,85 +1,126 @@
-// 搜索统一入口（规格 §4）
+// 检索：模型按关键词查，命中后返回该条消息的**全量**。
 //
-// mode='keyword'：只走 FTS。
-// mode='hybrid'：关键词 + 向量双路，RRF(k=60) 合并；
-//   NoopVectorStore（理论默认）下向量路为空，自动退化为纯关键词。
+// 用户要求：「模型要查找，就返回这一条的全量」——
+// 所以这里不做摘要、不截断正文。
+//
+// 便签（tags）是程序内部维护的，只随结果展示，模型不能按它检索。
 
 import type { MemoryStore } from '../store/sqlite.js'
-import type {
-  MemoryRecordResult,
-  ReasoningHit,
-  SearchMode,
-  SearchOptions,
-  VectorStore,
-} from '../types.js'
-import { keywordSearch } from './keyword.js'
-import { resolveVectorHits } from './vector.js'
-import { mergeSearch, type RrfResult } from './merge.js'
-import { OpenAICompatEmbedding } from './vector.js'
+import type { MessageResult, SearchMode, SearchOptions, VectorStore, EmbeddingProvider } from '../types.js'
+import { buildFtsQuery } from './segment.js'
+import { segmentForFts } from './segment.js'
 
-/** 搜索上下文：注入式向量存储（缺省 Noop） */
+/** 搜索上下文。 */
 export interface SearchContext {
   store: MemoryStore
   vectorStore?: VectorStore
-  embedding?: OpenAICompatEmbedding
+  embedding?: EmbeddingProvider
 }
 
-/** 统一搜索：返回合并后的结果列表（含 reasoning 命中） */
+/** 一条检索结果。 */
+export interface SearchHit {
+  /** 会话 id */
+  sessionId: string
+  /** 会话内索引：模型用它指代这条消息 */
+  idx: number
+  /** 角色 */
+  role: string
+  /** 是否仍在上下文里 */
+  inContext: boolean
+  /** 便签（程序内部维护，只读展示） */
+  tags: string[]
+  /** **全量正文** */
+  text: string
+  /** 相关度分数 */
+  score: number
+}
+
+/**
+ * 执行检索。
+ *
+ * keyword 模式走 FTS；hybrid 模式加向量路，RRF 合并。
+ * 命中后取该条消息的全量正文返回。
+ *
+ * @param ctx - 搜索上下文。
+ * @param query - 查询文本。
+ * @param options - 选项（模式、条数、限定会话）。
+ * @returns 结果列表（按分数降序）。
+ */
 export async function search(
   ctx: SearchContext,
   query: string,
   options: SearchOptions = {},
-): Promise<RrfResult[]> {
+): Promise<SearchHit[]> {
+  const limit = options.limit ?? 8
   const mode: SearchMode = options.mode ?? 'keyword'
-  const limit = options.limit ?? 20
-  const keywordResults = keywordSearch(ctx.store, query, { ...options, limit })
+  const q = query.trim()
+  if (q.length === 0) return []
 
-  if (mode === 'keyword' || !ctx.vectorStore || !ctx.embedding) {
-    // 纯关键词：包一层 RRF 结构保持返回类型一致（单路积分即 FTS 名次序）
-    return mergeSearch(keywordResults, [], { ...options, limit })
+  const hits = new Map<string, SearchHit>()
+
+  // ---- 关键词路 ----
+  const ftsQuery = buildFtsQuery(q)
+  if (ftsQuery) {
+    const rows = ctx.store.searchFts(ftsQuery, Math.max(limit * 3, 20), options.sessionId)
+    rows.forEach((row, i) => {
+      const msg = ctx.store.getByRowId(row.rowId)
+      if (!msg) return
+      const key = `${msg.sessionId}#${msg.idx}`
+      hits.set(key, toHit(msg, 1 / (60 + i + 1)))
+    })
   }
 
-  // 向量路：查询文本 → embedding → top-k → 回链正文
-  let vectorResults: Array<{
-    payload: MemoryRecordResult | ReasoningHit
-    isReasoning: boolean
-    vectorId: string
-  }> = []
-  try {
-    const queryEmbedding = await ctx.embedding.embed(query)
-    const k = Math.max(limit, 50)
-    const hits = await ctx.vectorStore.search(queryEmbedding, k)
-    const resolved = resolveVectorHits(ctx.store, hits)
-    vectorResults = resolved
-      .filter((hit) => hit.record || hit.reasoning)
-      .map((hit) => ({
-        payload: (hit.record ?? hit.reasoning) as MemoryRecordResult | ReasoningHit,
-        isReasoning: hit.kind === 'reasoning',
-        vectorId: hit.id,
-      }))
-  } catch {
-    // embedding 端点故障：退化到纯关键词，不让搜索整体失败
-    vectorResults = []
+  // ---- 向量路（仅在 hybrid 且真实现了向量时）----
+  if (mode === 'hybrid' && ctx.vectorStore && ctx.embedding) {
+    try {
+      const emb = await ctx.embedding.embed(q)
+      const vecHits = await ctx.vectorStore.search(emb, Math.max(limit * 3, 20))
+      vecHits.forEach((vh, i) => {
+        const parsed = parseVectorId(vh.id)
+        if (!parsed) return
+        const msg = ctx.store.getMessage(parsed.sessionId, parsed.idx)
+        if (!msg) return
+        const key = `${msg.sessionId}#${msg.idx}`
+        const contribution = 1 / (60 + i + 1)
+        const prev = hits.get(key)
+        if (prev) prev.score += contribution
+        else hits.set(key, toHit(msg, contribution))
+      })
+    } catch {
+      // 向量路故障不影响关键词结果
+    }
   }
 
-  return mergeSearch(keywordResults, vectorResults, { ...options, limit })
+  return [...hits.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
 }
 
-/** reasoning 专用检索：仅向量命中（规格 §5.1 /search reasoning 语义） */
-export async function searchReasoning(
-  ctx: SearchContext,
-  query: string,
-  options: SearchOptions = {},
-): Promise<ReasoningHit[]> {
-  if (!ctx.vectorStore || !ctx.embedding) return []
-  try {
-    const queryEmbedding = await ctx.embedding.embed(query)
-    const hits = await ctx.vectorStore.search(queryEmbedding, options.limit ?? 20)
-    const resolved = resolveVectorHits(ctx.store, hits)
-    return resolved
-      .filter((hit): hit is typeof hit & { reasoning: ReasoningHit } => hit.reasoning !== undefined)
-      .map((hit) => hit.reasoning)
-  } catch {
-    return []
+/** MessageResult → SearchHit（全量正文，不截断）。 */
+function toHit(msg: MessageResult, score: number): SearchHit {
+  return {
+    sessionId: msg.sessionId,
+    idx: msg.idx,
+    role: msg.role,
+    inContext: msg.inContext,
+    tags: msg.tags,
+    text: msg.text,
+    score,
   }
 }
+
+/** 解析向量 id `<sessionId>#<idx>`。 */
+export function parseVectorId(id: string): { sessionId: string; idx: number } | undefined {
+  const hash = id.lastIndexOf('#')
+  if (hash <= 0) return undefined
+  const idx = Number(id.slice(hash + 1))
+  if (!Number.isInteger(idx) || idx < 0) return undefined
+  return { sessionId: id.slice(0, hash), idx }
+}
+
+/** 构造向量 id。 */
+export function vectorId(sessionId: string, idx: number): string {
+  return `${sessionId}#${idx}`
+}
+
+export { segmentForFts }

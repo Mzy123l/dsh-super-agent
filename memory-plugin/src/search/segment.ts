@@ -75,3 +75,19 @@ export function termToFtsExpression(term: string): string {
   if (expressions.length === 1) return expressions[0] as string
   return `(${expressions.join(' AND ')})`
 }
+
+/**
+ * 查询侧：整段查询 → FTS5 表达式。
+ *
+ * 按空白切词，每个词各转一个表达式，词间用 AND 连接。
+ * 全为空时返回空串（调用方据此跳过检索）。
+ *
+ * @param query - 用户查询文本。
+ * @returns FTS5 MATCH 表达式；无有效词时为空串。
+ */
+export function buildFtsQuery(query: string): string {
+  const terms = query.trim().split(/\s+/).filter(t => t.length > 0)
+  if (terms.length === 0) return ''
+  const expressions = terms.map(termToFtsExpression)
+  return expressions.length === 1 ? expressions[0] as string : `(${expressions.join(' AND ')})`
+}

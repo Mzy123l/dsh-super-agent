@@ -1,163 +1,82 @@
-// 全部公共类型定义
+// 全部公共类型定义。
+//
+// 索引模型：每条消息在**会话内**有一个线性递增的索引 idx（从 0 开始）。
+// 索引会作为 token（`#0` `#1` …）标在消息里，随上下文一起传给模型。
 
-/**
- * 事件载体种类。
- *
- * 每一种载体都是「一个事件」，各自占用一个全局唯一的 `eventNo`。
- * 注意：一条 assistant 消息会产生**两个**事件——正文一个、思考一个。
- */
-export type EventKind =
-  | 'user'
-  | 'assistant'
-  | 'reasoning'
-  | 'tool-call'
-  | 'tool-result'
-  | 'summary'
+/** 消息角色。 */
+export type Role = 'user' | 'assistant' | 'tool' | 'system'
 
-/** 兼容旧名（检索侧仍按 kind 分类） */
-export type RecordKind = EventKind
-
-/**
- * 一个事件的完整描述（对应 event 表的一行）。
- *
- * **编号规则**：`eventNo` 是**会话内**的编号，从 1 开始独立递增。
- * 会话 A 的 #1 与会话 B 的 #1 是不同事件；
- * 唯一定位一个事件需要 (sessionId, eventNo) 这一对。
- *
- * `seq` 是 dsh 日志里的事件序号，只作为普通列保留。
- */
-export interface EventRecord {
-  /** 会话内编号（写入后由数据库分配） */
-  eventNo?: number
-  /** dsh 会话内的事件序号 */
-  seq: number
+/** 一条消息的完整描述（对应 message 表的一行）。 */
+export interface MessageRecord {
+  /** 会话内索引：0 = 该会话第一个 user prompt，之后线性递增 */
+  idx: number
   sessionId: string
-  kind: EventKind
-  /** ISO 时间 */
-  at: string
-  /** 可检索正文（reasoning 事件也用它，但不进 FTS） */
+  role: Role
+  /** 完整正文（检索时原样返回，不摘要、不截断） */
   text: string
-  /** 所在轮次 */
-  turn?: number
+  /** 首次进入上下文的时刻（ISO 8601） */
+  at: string
+  /** 是否仍在上下文里（false = 已被压缩遮蔽，但仍可检索） */
+  inContext?: boolean
+  /** 便签：程序内部维护的展示标记，模型只读 */
+  tags?: string[]
 }
 
-/** 兼容别名：检索侧沿用 MemoryRecord 这个名字 */
-export type MemoryRecord = EventRecord
-
-/** 兼容别名：思考事件与普通事件同构，只是不进 FTS */
-export type ReasoningRecord = EventRecord
-
-/** 带检索元数据的一条结果 */
-export interface EventSearchResult extends EventRecord {
+/** 带内部行号的消息（检索结果用）。 */
+export interface MessageResult extends MessageRecord {
   /** 数据库内部行号（仅供 FTS 关联，不对外做语义） */
   rowId: number
-  /** 会话内编号（必填，来自数据库） */
-  eventNo: number
-  /** 该事件当前是否已被压缩遮蔽 */
-  shadowed: boolean
-  /** FTS rank 分数（关键词路径） */
+  /** 索引（必填） */
+  idx: number
+  /** 上下文状态（必填） */
+  inContext: boolean
+  /** 便签（必填） */
+  tags: string[]
+  /** FTS rank 分数 */
   rank?: number
-  /** RRF 合并分数（混合路径） */
+  /** RRF 合并分数 */
   score?: number
 }
 
-/** 兼容别名 */
-export type MemoryRecordResult = EventSearchResult
-
-/** 关键词命中的轻量结果（FTS 路径用） */
+/** 关键词命中的轻量结果。 */
 export interface KeywordHit {
-  /** 数据库内部行号（FTS rowid） */
   rowId: number
-  /** 会话内编号 */
-  eventNo: number
   sessionId: string
-  seq: number
-  kind: EventKind
+  idx: number
+  role: Role
   at: string
-  /** FTS rank 分数（越小越相关，SQLite 约定） */
   rank: number
 }
 
-/** reasoning 命中的结果（kind 恒为 'reasoning'，供调用方区分"思考"与"事实"） */
-export interface ReasoningHit {
-  seq: number
-  sessionId: string
-  at: string
-  turn?: number
-  text: string
-  score?: number
-}
-
-/** 向量检索记录 id 约定：'r:<sessionId>:<seq>:<kind>' 或 'n:<sessionId>:<seq>' */
+/** 向量检索记录 id 约定：`<sessionId>#<idx>` */
 export type VectorRecordId = string
 
-/** 嵌入向量提供者（注入式，插件不绑定具体模型） */
+/** 嵌入向量提供者（注入式）。 */
 export interface EmbeddingProvider {
-  /** 生成一段文本的 embedding */
   embed(text: string): Promise<number[]>
 }
 
-/** 向量存储接口（注入式） */
+/** 向量存储接口（注入式）。 */
 export interface VectorStore {
-  /** 写入或更新一条向量 */
   upsert(id: VectorRecordId, embedding: number[]): Promise<void>
-  /** 按向量检索 top-k，返回记录 id */
   search(embedding: number[], k: number): Promise<Array<{ id: VectorRecordId; score: number }>>
-  /** 已存向量条数 */
   count(): number
-  /** 清空（重建索引用） */
   clear(): Promise<void>
 }
 
-/** 提取管线产出：records + reasoning + 一次性元数据 */
-export interface ExtractResult {
-  records: MemoryRecord[]
-  reasoning: ReasoningRecord[]
-  /** 本文件涉及的全部 shadowed seq（来自 compaction/summary 与 compaction/prune） */
-  shadowedSeqs: Set<number>
-  /** 本文件的轮次起点：seq -> turn（来自 turn/start） */
-  turnStarts: Map<number, number>
-  /** 最后一条事件的 seq（增量索引用水位线） */
-  lastSeq: number
-  /** 事件总数（含解析失败的行） */
-  eventCount: number
-  /** JSON 解析失败的行数 */
-  parseErrors: number
-}
-
-/** 读取一个会话文件的产出 */
-export interface SessionIngest extends ExtractResult {
-  sessionId: string
-  filePath: string
-  /** zstd 帧数 */
-  frameCount: number
-  /** 解压失败的帧数（实时写入可能出现坏帧/残帧） */
-  badFrames: number
-}
-
-/** 会话级索引水位线（增量索引用） */
-export interface SessionWatermark {
-  sessionId: string
-  lastSeq: number
-  indexedAt: string
-  eventCount: number
-}
-
-/** 索引状态统计（status 命令用） */
+/** 索引状态统计。 */
 export interface IndexStatus {
-  /** 已索引的会话数 */
+  /** 有消息的会话数 */
   sessions: number
-  /** 事件总数（每个事件都有独立编号） */
-  events: number
-  /** 其中：思考事件数 */
-  reasoning: number
-  /** 其中：压缩摘要事件数 */
-  summaries: number
-  /** 其中：被压缩遮蔽的事件数 */
-  shadowed: number
-  /** 已封存段数（seal） */
-  sealed: number
-  /** 最近一次索引时间（ISO），从未索引为 null */
+  /** 消息总数 */
+  messages: number
+  /** 其中仍在上下文里的 */
+  inContext: number
+  /** 提炼段总数 */
+  segments: number
+  /** 其中 live 阶段（原文与总结并存）的 */
+  liveSegments: number
+  /** 最近一次索引时间 */
   lastIndexedAt: string | null
 }
 
@@ -168,20 +87,49 @@ export type SearchMode = 'keyword' | 'hybrid'
 export interface SearchOptions {
   mode?: SearchMode
   limit?: number
-  /** 'rank'（默认，按 FTS rank / RRF 分）或 'time'（按时间倒序） */
-  order?: 'rank' | 'time'
+  /** 限定会话（不给则跨会话） */
+  sessionId?: string
 }
 
 /** 索引器配置 */
 export interface IndexerConfig {
-  /** 会话日志根目录（只读） */
+  /** 会话日志根目录（只读数据源） */
   sessionsDir: string
-  /** 插件数据目录（索引写入处，默认 ./data） */
+  /** 插件数据目录 */
   dataDir: string
-  /** 向量存储（可选，Noop 时跳过向量化） */
   vectorStore?: VectorStore
-  /** embedding 提供者（与 vectorStore 配套） */
   embedding?: EmbeddingProvider
-  /** 单条文本向量化长度上限（字符） */
-  embedMaxChars?: number
+}
+
+/** 一个会话文件。 */
+export interface SessionFile {
+  sessionId: string
+  path: string
+  /** 文件修改时间（毫秒），用于增量判断 */
+  mtimeMs: number
+  sizeBytes: number
+}
+
+/** 索引报告的累加器。 */
+export interface IndexReport {
+  sessionsScanned: number
+  sessionsIndexed: number
+  sessionsSkipped: number
+  messagesWritten: number
+  vectorsWritten: number
+  badFrames: number
+  parseErrors: number
+  durationMs: number
+}
+
+/** 一个提炼段。 */
+export interface Segment {
+  segmentNo: number
+  sessionId: string
+  fromIdx: number
+  toIdx: number
+  summary: string
+  recent: string
+  stage: 'live' | 'archived'
+  at: string
 }
