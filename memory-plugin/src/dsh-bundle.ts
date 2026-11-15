@@ -11,17 +11,32 @@
 // ④ 不做轮末自动触发 —— 本文件**不注入任何上下文**，只在模型显式调用检索工具时返回。
 
 import type { Context } from '@deepseek-ai/cordis'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+
+/**
+ * 声明自定义的消息来源种类。
+ *
+ * dsh 的 `MessageSourceMap` 是闭合联合类型，插件要注入带自有来源的消息，
+ * 必须像官方 `dsh-agent-instructions` 那样用模块增强扩展它。
+ * 否则 `createUserMessage` 会拒绝这个 source.kind。
+ */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'memory-loop-prompt': { kind: 'memory-loop-prompt' }
+  }
+}
 import { MemoryStore } from './store/sqlite.js'
 import { discoverSessionFiles, indexAll, indexSession, type IndexReport } from './ingest/indexer.js'
 import { search } from './search/index.js'
 import { NoopVectorStore } from './search/vector.js'
 import type { IndexerConfig, SearchMode } from './types.js'
 import { SegmentStore } from './seal/store.js'
-import { createSummarizeTool } from './seal/tool.js'
-import { applySegment, hidePromptAfterUse } from './seal/apply.js'
+import { applySegment } from './seal/apply.js'
 import { applyArchive } from './seal/lifecycle.js'
-import { createSpansTool, type SpanEvent } from './seal/spans.js'
+import type { SpanEvent } from './seal/spans.js'
+import { runLoopStep, type AssistantSnapshot } from './loop/engine.js'
+import { PendingStore } from './loop/store.js'
 
 /** 哪些事件类型算「有内容的」，需要计入区间统计。 */
 function isContentEvent(type: string | undefined): boolean {
@@ -31,6 +46,18 @@ function isContentEvent(type: string | undefined): boolean {
     || type === 'tool/call'
     || type === 'tool/result'
     || type === 'compaction/summary'
+}
+
+/** 从 assistant 事件里取出可见文本（不含 reasoning）。 */
+function extractAssistantText(event: { data?: unknown }): string {
+  const data = event.data as { message?: { content?: Array<{ type?: string; text?: string }> } } | undefined
+  const blocks = data?.message?.content
+  if (!Array.isArray(blocks)) return ''
+  return blocks
+    .filter(b => b?.type === 'text' && typeof b.text === 'string')
+    .map(b => b.text as string)
+    .join('\n')
+    .trim()
 }
 
 /** 粗估一个事件的字符数（用于长度建议，不做精确 token 计数）。 */
@@ -64,6 +91,8 @@ export interface Config {
   maxResults?: number
   /** 「近几步」保留原文的轮次数；更早的才允许封存。 */
   keepTurns?: number
+  /** 是否允许循环自动安排提炼（默认 true）。 */
+  autoSummarize?: boolean
 }
 
 const DEFAULT_MAX_RESULTS = 8
@@ -116,7 +145,7 @@ export function apply(ctx: Context): void {
     const sid = (session as unknown as { id?: string }).id
     if (typeof sid !== 'string') return
 
-    type Ev = { type?: string; seq?: number; data?: { turn?: number } }
+    type Ev = { type?: string; seq?: number; time?: number; data?: { turn?: number } }
     const ev = event as unknown as Ev
 
     if (ev.type === 'turn/start') {
@@ -134,28 +163,78 @@ export function apply(ctx: Context): void {
       list.push({ seq: ev.seq, turn, chars: estimateChars(ev) })
       eventCache.set(sid, list)
     }
+
+    // 记录最近一条 assistant 的**可见文本**——收割提炼结果时要读它。
+    // 这是上一版的死代码缺口：只读不写，导致收割永远拿不到内容。
+    if (ev.type === 'assistant/message' && typeof ev.seq === 'number') {
+      const text = extractAssistantText(ev)
+      if (text.length > 0) {
+        lastAssistant.set(sid, {
+          text,
+          seq: ev.seq,
+          at: new Date(ev.time ?? Date.now()).toISOString(),
+        })
+      }
+    }
   }, { global: true })
 
-  // ---- 总结相关工具 ----
-  const summarizeHost = {
-    store: segmentStore,
-    latestTurn: (sessionId: string) => latestTurns.get(sessionId) ?? 0,
-    apply: (c: Context, segment: Parameters<typeof applySegment>[1]) => applySegment(c, segment),
-    warn: (message: string) => ctx.logger.warn('memory-plugin: %s', message),
-    // 总结完成后，把触发提炼的那条提示遮蔽掉（用户要求只出现一次）
-    hidePrompt: (sessionId: string, promptSeq: number) => hidePromptAfterUse(ctx, sessionId, promptSeq),
-    // 总结完成后顺带做一次窗口降级（不是索引，只改段状态）
-    archiveDue: (sessionId: string) =>
-      applyArchive(segmentStore, sessionId, latestTurns.get(sessionId) ?? 0, config.keepTurns ?? DEFAULT_KEEP_TURNS),
-  }
-  ctx.tools.register(createSummarizeTool(summarizeHost, ctx))
+  // ---- 总结循环：由插件在 pre-step 里驱动，不经过工具调用 ----
+  const pendingStore = new PendingStore(store.raw)
 
-  ctx.tools.register(createSpansTool({
-    store: segmentStore,
-    latestTurn: (sessionId) => latestTurns.get(sessionId) ?? 0,
-    eventsOf: (sessionId) => eventCache.get(sessionId) ?? [],
-    keepTurns: config.keepTurns ?? DEFAULT_KEEP_TURNS,
-  }))
+  /** 各会话最近一条 assistant 回复（供收割用）。 */
+  const lastAssistant = new Map<string, AssistantSnapshot>()
+
+  /**
+   * pre-step 钩子：每个模型步骤开始前运行。
+   *
+   * 契约（照官方 dsh-agent-instructions 的用法）：
+   *   `(payload, next)` → `await next()` 拿最终 decision → 修改 → 原样返回。
+   *
+   * 用户要求：「不要让模型自己调 memory_spans / memory_summarize，
+   * 按照我说的改变消息循环机制」。
+   */
+  ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
+    // 先让后续监听器跑完，拿到最终决定
+    const decision = await next()
+    signal.throwIfAborted()
+
+    try {
+      const sessionId = (agent.session as { id?: string }).id
+      if (typeof sessionId !== 'string' || sessionId.length === 0) return decision
+
+      const action = runLoopStep(sessionId, {
+        segments: segmentStore,
+        pending: pendingStore,
+        latestTurn: (sid) => latestTurns.get(sid) ?? 0,
+        eventsOf: (sid) => eventCache.get(sid) ?? [],
+        lastAssistant: (sid) => lastAssistant.get(sid),
+        apply: (segment) => applySegment(ctx, segment),
+        keepTurns: config.keepTurns ?? DEFAULT_KEEP_TURNS,
+        autoSummarize: config.autoSummarize ?? true,
+        warn: (message) => ctx.logger.warn('memory-plugin: %s', message),
+      })
+
+      if (action.kind !== 'injected') return decision
+      if (decision.kind === 'reject') return decision
+
+      // 注入：把提炼提示插在本步最后一条已领取消息之后
+      // （照官方 dsh-agent-instructions 的做法）
+      const prompt = createUserMessage({
+        content: [{ type: 'text', text: action.promptText }],
+        source: { kind: 'memory-loop-prompt' },
+      })
+      const lastClaimedIndex = decision.messages.findLastIndex(m => messages.includes(m))
+      const entered = decision.messages.toSpliced(lastClaimedIndex + 1, 0, prompt)
+      return { ...decision, messages: entered }
+    } catch (error) {
+      // 循环失败绝不影响正常对话
+      ctx.logger.warn('memory-plugin: loop step failed: %s', String(error))
+      return decision
+    }
+  }, { global: true, prepend: true })
+
+  // 注意：不再注册 memory_spans / memory_summarize 工具。
+  // 用户要求改由 pre-step 的消息循环驱动（见上方 pre-step 钩子）。
 
   /** 空的索引报告（增量索引时复用同一个 report 累加）。 */
   const emptyReport = (): IndexReport => ({
