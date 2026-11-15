@@ -16,6 +16,10 @@ import { PendingStore } from './summary/pending.js'
 import { runSummaryStep, SUMMARY_THRESHOLD, type SummaryHost } from './summary/flow.js'
 import { extractUnits } from './ingest/units.js'
 import { renderUnits, DEFAULT_WINDOW, type RenderOptions } from './projection/render.js'
+import { applyProjection } from './projection/executor.js'
+import { MemoryRenderCache } from './projection/apply.js'
+import type { SeqReader } from './projection/seqmap.js'
+import type { SurfaceWriter } from './projection/executor.js'
 import { search } from './search/index.js'
 import { SqliteVectorStore, HashingEmbedding } from './search/vector.js'
 import { vectorId } from './search/index.js'
@@ -53,6 +57,8 @@ function parseSteps(raw: string | undefined): PlanStep[] {
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     'memory-summary-prompt': { kind: 'memory-summary-prompt' }
+    'memory-plan-view': { kind: 'memory-plan-view' }
+    'memory-projection': { kind: 'memory-projection' }
   }
 }
 
@@ -114,6 +120,8 @@ export function apply(ctx: Context): void {
   const todos = new TodoStore(store.raw)
   const overrides = new OverrideStore(store.raw)
   const plans = new PlanStore(store.raw)
+  /** 已写入 surface 的渲染缓存（避免重复 append） */
+  const renderCache = new MemoryRenderCache()
 
   /** 各会话最近一条 assistant 可见文本与时刻（供收割）。 */
   const lastAssistant = new Map<string, { text: string; at: string }>()
@@ -198,6 +206,25 @@ export function apply(ctx: Context): void {
           const at = decision.messages.findLastIndex(m => messages.includes(m))
           return { ...decision, messages: decision.messages.toSpliced(at + 1, 0, prompt) }
         }
+      }
+
+      // 2) 发送投影：把单位状态写进 surface（#N / summary / 窗口取舍）
+      const sessions = (ctx as unknown as { sessions?: { get?: (id: string) => unknown } }).sessions
+      const session = sessions?.get?.(sessionId) as SurfaceWriter | undefined
+      if (session && typeof session.eventAt === 'function') {
+        applyProjection(ctx, sessionId, session, store, config.window, renderCache, folds)
+      }
+
+      // 3) 规划注入：当前计划以紧凑视图进入发送上下文
+      const plan = plans.get(sessionId)
+      if (plan && plan.status === 'active' && plan.steps.length > 0) {
+        const planText = renderPlan(plan)
+        const planMsg = createUserMessage({
+          content: [{ type: 'text', text: planText }],
+          source: { kind: 'memory-plan-view' },
+        })
+        const at = decision.messages.findLastIndex(m => messages.includes(m))
+        return { ...decision, messages: decision.messages.toSpliced(at + 1, 0, planMsg) }
       }
 
       return decision
