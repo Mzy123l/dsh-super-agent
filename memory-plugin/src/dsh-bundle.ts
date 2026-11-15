@@ -84,6 +84,9 @@ export function apply(ctx: Context): void {
   /** 各会话的最新轮次（由 session/event 维护）。 */
   const latestTurns = new Map<string, number>()
 
+  // 这个监听器**不是触发**：它只把轮次号记进一个内存 Map，
+  // 供 `memory_seal` 写入 segment.turn 时读取。
+  // 它不索引、不注入上下文、不发消息、不调用任何工具。
   ctx.on('session/event', (session, event) => {
     if (event.type !== 'turn/start') return
     const sid = (session as unknown as { id?: string }).id
@@ -185,32 +188,29 @@ export function apply(ctx: Context): void {
     presentCall: args => ({ card: 'generic', title: 'memory_search', rawInput: args }),
   }))
 
-  // 会话结束时增量索引：只读日志、只写自己的副本。
-  ctx.on('agent/disposed', async ({ agent }) => {
-    try {
-      const sessionId = (agent.session as { id?: unknown; sessionId?: unknown }).id
-        ?? (agent.session as { sessionId?: unknown }).sessionId
-      if (typeof sessionId !== 'string' || sessionId.length === 0) return
-      const files = discoverSessionFiles(config.sessionsDir).filter(f => f.sessionId === sessionId)
-      for (const file of files) {
-        await indexSession(store, vectorStore, indexerConfig, file, emptyReport())
-      }
-    } catch {
-      // 索引失败不能影响会话结束；健康状态由面板另行观测。
-    }
-  })
+  // 注意：**这里没有自动索引**。
+  //
+  // 用户明确要求「不做程序化触发」——包括不在会话结束时、不在每轮结束时、
+  // 不在任何事件上自动跑索引。索引只能由人显式发起（CLI 或面板按钮）。
+  //
+  // 因此 `agent/disposed` 上不挂任何监听器。
+  // 索引入口见下方 `ctx.provide('memory', ...)`，它只暴露函数、不自己调用。
 
   // 提供手动索引入口（面板/CLI 复用）。
   // 必须用 ctx.provide：cordis 的 ctx 是代理，直接赋值未声明的属性会抛
   // "cannot set property ... without provide"，导致整个插件激活失败。
   ctx.provide('memory', {
+    /** 显式全量索引——只由人/CLI 调用，插件自己不触发。 */
     indexAll: () => indexAll(indexerConfig, store),
+    /** 显式索引单个会话——同样只由人调用。 */
     indexSession: async (id: string) => {
       const files = discoverSessionFiles(config.sessionsDir).filter(f => f.sessionId === id)
       for (const file of files) {
         await indexSession(store, vectorStore, indexerConfig, file, emptyReport())
       }
     },
+    /** 封存段仓储（读取已封存的历史总结）。 */
+    seals: sealStore,
     store,
   })
 }
