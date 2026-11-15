@@ -40,6 +40,10 @@ export interface SummarizeHost {
   latestTurn(sessionId: string): number
   /** 把段应用到会话表面。 */
   apply(ctx: Context, segment: Segment): void
+  /** 遮蔽触发提炼的那条提示（用户要求：只出现一次）。 */
+  hidePrompt(sessionId: string, promptSeq: number): void
+  /** 总结完成后做一次窗口降级（只改段状态，不索引）。 */
+  archiveDue(sessionId: string): number
   /** 诊断日志。 */
   warn(message: string): void
 }
@@ -54,6 +58,8 @@ interface SummarizeArgs {
   to_seq?: number
   /** 该段原文（近期阶段随 summary 一起保留；省略则只留总结） */
   recent_text?: string
+  /** 触发提炼的那条提示的 seq；给了就在提炼完成后遮蔽它。 */
+  prompt_seq?: number
 }
 
 /**
@@ -87,6 +93,10 @@ export function createSummarizeTool(host: SummarizeHost, ctx: Context) {
           'The verbatim text of the span. Keep it when the span is recent so both original and summary are visible. '
           + 'Omit for older spans that should keep only the summary.',
       },
+      prompt_seq: {
+        type: 'number',
+        description: 'Seq of the guidance prompt that triggered this summarization; it is hidden after use so it never repeats.',
+      },
     },
     output: {
       schema: {
@@ -98,6 +108,7 @@ export function createSummarizeTool(host: SummarizeHost, ctx: Context) {
           guidance: { type: 'string' },
           recommendation: { type: 'string' },
           segmentNo: { type: 'number' },
+          archived: { type: 'number' },
           error: { type: 'string' },
         },
       },
@@ -178,7 +189,25 @@ export function createSummarizeTool(host: SummarizeHost, ctx: Context) {
           }
         }
 
-        return { ok: true, phase: 'applied', segmentNo: eventNo }
+        // 提炼完成后遮蔽触发提示（只出现一次）
+        if (typeof args.prompt_seq === 'number') {
+          try {
+            host.hidePrompt(sessionId, args.prompt_seq)
+          } catch (error) {
+            // 遮蔽失败不影响总结本身已经生效；只记日志。
+            host.warn(`memory_summarize: hide prompt failed: ${String(error)}`)
+          }
+        }
+
+        // 顺带做一次窗口降级：滑出近期窗口的段改为只留总结。
+        let archived = 0
+        try {
+          archived = host.archiveDue(sessionId)
+        } catch (error) {
+          host.warn(`memory_summarize: archive pass failed: ${String(error)}`)
+        }
+
+        return { ok: true, phase: 'applied', segmentNo: eventNo, archived }
       } catch (error) {
         host.warn(`memory_summarize failed: ${String(error)}`)
         return { ok: false, phase: 'error', error: String(error) }

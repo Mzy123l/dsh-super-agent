@@ -19,7 +19,29 @@ import { NoopVectorStore } from './search/vector.js'
 import type { IndexerConfig, SearchMode } from './types.js'
 import { SegmentStore } from './seal/store.js'
 import { createSummarizeTool } from './seal/tool.js'
-import { applySegment } from './seal/apply.js'
+import { applySegment, hidePromptAfterUse } from './seal/apply.js'
+import { applyArchive } from './seal/lifecycle.js'
+import { createSpansTool, type SpanEvent } from './seal/spans.js'
+
+/** 哪些事件类型算「有内容的」，需要计入区间统计。 */
+function isContentEvent(type: string | undefined): boolean {
+  return type === 'user/message'
+    || type === 'assistant/message'
+    || type === 'reasoning'
+    || type === 'tool/call'
+    || type === 'tool/result'
+    || type === 'compaction/summary'
+}
+
+/** 粗估一个事件的字符数（用于长度建议，不做精确 token 计数）。 */
+function estimateChars(event: { data?: unknown }): number {
+  try {
+    const raw = JSON.stringify(event.data ?? {})
+    return raw.length
+  } catch {
+    return 0
+  }
+}
 
 /** Cordis 插件名。 */
 export const name = 'memory-plugin'
@@ -84,24 +106,56 @@ export function apply(ctx: Context): void {
   /** 各会话的最新轮次（由 session/event 维护）。 */
   const latestTurns = new Map<string, number>()
 
-  // 这个监听器**不是触发**：它只把轮次号记进一个内存 Map，
-  // 供 `memory_seal` 写入 segment.turn 时读取。
+  /** 各会话的可见事件缓存（供 memory_spans 计算区间）。 */
+  const eventCache = new Map<string, SpanEvent[]>()
+
+  // 这个监听器**不是触发**：它只维护内存里的轮次号与事件摘要，
+  // 供 `memory_summarize` / `memory_spans` 读取。
   // 它不索引、不注入上下文、不发消息、不调用任何工具。
   ctx.on('session/event', (session, event) => {
-    if (event.type !== 'turn/start') return
     const sid = (session as unknown as { id?: string }).id
-    const turn = (event as unknown as { data?: { turn?: number } }).data?.turn
-    if (typeof sid === 'string' && typeof turn === 'number') {
-      latestTurns.set(sid, Math.max(latestTurns.get(sid) ?? 0, turn))
+    if (typeof sid !== 'string') return
+
+    type Ev = { type?: string; seq?: number; data?: { turn?: number } }
+    const ev = event as unknown as Ev
+
+    if (ev.type === 'turn/start') {
+      const turn = ev.data?.turn
+      if (typeof turn === 'number') {
+        latestTurns.set(sid, Math.max(latestTurns.get(sid) ?? 0, turn))
+      }
+      return
+    }
+
+    // 记录事件摘要：seq + turn + 粗估字符数，供区间计算用。
+    if (typeof ev.seq === 'number' && isContentEvent(ev.type)) {
+      const turn = ev.data?.turn ?? latestTurns.get(sid)
+      const list = eventCache.get(sid) ?? []
+      list.push({ seq: ev.seq, turn, chars: estimateChars(ev) })
+      eventCache.set(sid, list)
     }
   }, { global: true })
 
-  ctx.tools.register(createSummarizeTool({
+  // ---- 总结相关工具 ----
+  const summarizeHost = {
+    store: segmentStore,
+    latestTurn: (sessionId: string) => latestTurns.get(sessionId) ?? 0,
+    apply: (c: Context, segment: Parameters<typeof applySegment>[1]) => applySegment(c, segment),
+    warn: (message: string) => ctx.logger.warn('memory-plugin: %s', message),
+    // 总结完成后，把触发提炼的那条提示遮蔽掉（用户要求只出现一次）
+    hidePrompt: (sessionId: string, promptSeq: number) => hidePromptAfterUse(ctx, sessionId, promptSeq),
+    // 总结完成后顺带做一次窗口降级（不是索引，只改段状态）
+    archiveDue: (sessionId: string) =>
+      applyArchive(segmentStore, sessionId, latestTurns.get(sessionId) ?? 0, config.keepTurns ?? DEFAULT_KEEP_TURNS),
+  }
+  ctx.tools.register(createSummarizeTool(summarizeHost, ctx))
+
+  ctx.tools.register(createSpansTool({
     store: segmentStore,
     latestTurn: (sessionId) => latestTurns.get(sessionId) ?? 0,
-    apply: (c, segment) => applySegment(c, segment),
-    warn: (message) => ctx.logger.warn('memory-plugin: %s', message),
-  }, ctx))
+    eventsOf: (sessionId) => eventCache.get(sessionId) ?? [],
+    keepTurns: config.keepTurns ?? DEFAULT_KEEP_TURNS,
+  }))
 
   /** 空的索引报告（增量索引时复用同一个 report 累加）。 */
   const emptyReport = (): IndexReport => ({

@@ -6,6 +6,9 @@
 //   memory-plugin status [--data <dir>]
 
 import { MemoryStore } from './store/sqlite.js'
+import { SegmentStore } from './seal/store.js'
+import { applyArchive } from './seal/lifecycle.js'
+import { computeSpans, coveredSeqs } from './seal/spans.js'
 import { indexAll, discoverSessionFiles } from './ingest/indexer.js'
 import { search } from './search/index.js'
 import { NoopVectorStore, OpenAICompatEmbedding, OpenAICompatVectorStore } from './search/vector.js'
@@ -167,6 +170,58 @@ async function main(): Promise<number> {
       return 0
     }
 
+    case 'spans': {
+      // 列出某会话可总结的区间（只读）
+      const config = buildConfig(args.flags)
+      const sessionId = args.flags.get('session')
+      if (!sessionId) {
+        console.error('用法：memory-plugin spans --session <id>')
+        return 2
+      }
+      const store = new MemoryStore({ path: join(config.dataDir, 'memory.sqlite') })
+      const segments = new SegmentStore(store.raw)
+      const covered = coveredSeqs(segments, sessionId)
+      const events = store.listEvents(sessionId, undefined, 100000, 0).map(e => ({
+        seq: e.seq,
+        turn: e.turn,
+        chars: e.text.length,
+      }))
+      const latestTurn = events.reduce((m, e) => Math.max(m, e.turn ?? 0), 0)
+      const keepTurns = Number(args.flags.get('keep') ?? 3)
+      const spans = computeSpans(events, covered, latestTurn, keepTurns)
+      if (args.flags.get('json') === 'true') {
+        console.log(JSON.stringify({ sessionId, latestTurn, keepTurns, spans }, null, 2))
+      } else {
+        console.log(`session ${sessionId} · latest turn ${latestTurn} · keep ${keepTurns}`)
+        console.log(`可总结区间：${spans.length} 个`)
+        for (const s of spans) {
+          console.log(
+            `  turn ${s.fromTurn}  seq ${s.fromSeq}–${s.toSeq}  ${s.eventCount} 条  ${s.chars} 字符  ${s.recommendation}`,
+          )
+        }
+      }
+      store.close()
+      return 0
+    }
+
+    case 'archive': {
+      // 把滑出近期窗口的段降级为「只留总结」
+      const config = buildConfig(args.flags)
+      const sessionId = args.flags.get('session')
+      if (!sessionId) {
+        console.error('用法：memory-plugin archive --session <id> [--keep 3]')
+        return 2
+      }
+      const store = new MemoryStore({ path: join(config.dataDir, 'memory.sqlite') })
+      const segments = new SegmentStore(store.raw)
+      const latestTurn = Number(args.flags.get('latest') ?? 0)
+      const keepTurns = Number(args.flags.get('keep') ?? 3)
+      const archived = applyArchive(segments, sessionId, latestTurn, keepTurns)
+      console.log(`已降级 ${archived} 个段（session=${sessionId} latestTurn=${latestTurn} keep=${keepTurns}）`)
+      store.close()
+      return 0
+    }
+
     case 'status': {
       const config = buildConfig(args.flags)
       const store = new MemoryStore({ path: join(config.dataDir, 'memory.sqlite') })
@@ -209,6 +264,8 @@ async function main(): Promise<number> {
   memory-plugin search "query" [--mode keyword|hybrid] [--limit 20] [--order rank|time] [--json]
   memory-plugin status [--data <dir>]
   memory-plugin serve [--port 7800] [--data <dir>]
+  memory-plugin spans --session <id> [--keep 3]       列出可总结的区间（只读）
+  memory-plugin archive --session <id> --latest N [--keep 3]  降级滑出窗口的段
 
 说明：
   - 会话目录只读；索引数据写入 --data（默认 ./data）
