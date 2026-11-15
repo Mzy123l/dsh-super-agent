@@ -17,9 +17,9 @@ import { discoverSessionFiles, indexAll, indexSession, type IndexReport } from '
 import { search } from './search/index.js'
 import { NoopVectorStore } from './search/vector.js'
 import type { IndexerConfig, SearchMode } from './types.js'
-import { SealStore } from './seal/store.js'
-import { createSealTool } from './seal/tool.js'
-import { applySeal } from './seal/apply.js'
+import { SegmentStore } from './seal/store.js'
+import { createSummarizeTool } from './seal/tool.js'
+import { applySegment } from './seal/apply.js'
 
 /** Cordis 插件名。 */
 export const name = 'memory-plugin'
@@ -79,7 +79,7 @@ export function apply(ctx: Context): void {
 
   // ---- L2 层：封存（近几步全量 + 总结，再前面的只有总结）----
   // 复用同一个 SQLite 连接：封存段与检索记录同库不同表。
-  const sealStore = new SealStore(store.raw)
+  const segmentStore = new SegmentStore(store.raw)
 
   /** 各会话的最新轮次（由 session/event 维护）。 */
   const latestTurns = new Map<string, number>()
@@ -96,13 +96,10 @@ export function apply(ctx: Context): void {
     }
   }, { global: true })
 
-  ctx.tools.register(createSealTool({
-    store: sealStore,
+  ctx.tools.register(createSummarizeTool({
+    store: segmentStore,
     latestTurn: (sessionId) => latestTurns.get(sessionId) ?? 0,
-    keepTurns: config.keepTurns ?? DEFAULT_KEEP_TURNS,
-    appendToSession: (sessionId, segment) => {
-      applySeal(ctx, segment as Parameters<typeof applySeal>[1])
-    },
+    apply: (c, segment) => applySegment(c, segment),
     warn: (message) => ctx.logger.warn('memory-plugin: %s', message),
   }, ctx))
 
@@ -210,7 +207,7 @@ export function apply(ctx: Context): void {
       }
     },
     /** 封存段仓储（读取已封存的历史总结）。 */
-    seals: sealStore,
+    segments: segmentStore,
     store,
   })
 }

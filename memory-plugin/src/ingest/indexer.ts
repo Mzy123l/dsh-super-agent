@@ -98,15 +98,22 @@ export async function indexSession(
   report.recordsWritten += extracted.records.length
   report.reasoningWritten += extracted.reasoning.length
 
-  // shadowed 标记：extractor 收集的 shadowedSeqs，按 (sessionId, seq) 应用到所有 kind
-  const rows = extracted.records.map((record) => ({
-    record,
-    shadowed: extracted.shadowedSeqs.has(record.seq),
-  }))
+  // 统一事件列表：正文事件 + 思考事件都是「事件」，各自占一个会话内编号。
+  // shadowed 标记按 (sessionId, seq) 应用。
+  const rows: Array<{ event: MemoryRecord; shadowed: boolean }> = [
+    ...extracted.records.map(record => ({
+      event: record,
+      shadowed: extracted.shadowedSeqs.has(record.seq),
+    })),
+    ...extracted.reasoning.map(event => ({
+      event,
+      shadowed: extracted.shadowedSeqs.has(event.seq),
+    })),
+  ]
 
-  // 写库整体包一个事务（8 万+ 记录时逐条自动提交事务是数量级的开销）
+  // 写库整体包一个事务（8 万+ 事件时逐条自动提交事务是数量级的开销）
   store.transaction(() => {
-    store.insertBatch(rows, extracted.reasoning)
+    store.insertBatch(rows)
     store.setWatermark({
       sessionId: log.sessionId,
       lastSeq: extracted.lastSeq,

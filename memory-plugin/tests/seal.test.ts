@@ -1,183 +1,265 @@
-// 封存（seal）的单元测试。
+// 封存段（segment）测试。
 //
-// 验证三件事：
-// 1. buildSealEvent 产出的 surfaceOp 形状符合 dsh 的 `isReplaceOp` 严格校验
-// 2. SealStore 的防重复封存真的生效
-// 3. applySeal 在拿不到会话时明确失败（不静默降级）
+// 重点验证用户要求的核心语义：
+// 1. 一段 = 一个事件 = 一个会话内编号
+// 2. 段内用标签分槽（recent / summary）
+// 3. 提炼必须保留否决路径（提示词里明确要求）
+// 4. 编号在会话内独立递增
 
-import { describe, expect, it, beforeEach } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach } from 'vitest'
 import DatabaseConstructor from 'better-sqlite3'
-import { SealStore } from '../src/seal/store.js'
-import { buildSealEvent, shouldSeal } from '../src/seal/types.js'
-import { applySeal, formatSealSummary } from '../src/seal/apply.js'
-import type { SealedSegment } from '../src/seal/types.js'
+import { SegmentStore } from '../src/seal/store.js'
+import {
+  composeSlottedText,
+  isSlottedText,
+  decideSummarize,
+  buildSummarizePrompt,
+  SLOT_TAGS,
+  type Segment,
+} from '../src/seal/types.js'
+import { collectShadowedSeqs, applySegment } from '../src/seal/apply.js'
 
-/** 造一个内存库。 */
-function memoryDb() {
-  return DatabaseConstructor(':memory:')
-}
-
-/** 造一条封存段。 */
-function segment(over: Partial<SealedSegment> = {}): SealedSegment {
+/** 造一个段。 */
+function seg(over: Partial<Omit<Segment, 'eventNo'>> = {}): Omit<Segment, 'eventNo'> {
   return {
-    id: 'seal-test-1',
     sessionId: 'session-a',
     fromSeq: 10,
     toSeq: 20,
-    summary: '修好了登录超时；结论是 token 刷新要提前 5 分钟。',
-    reason: '修复已验证',
+    shadowedSeqs: [10, 11, 12],
+    summary: '否决 A：因为鉴权冲突\n否决 B：因为延迟超标\n最终：D',
+    recent: '近期的原文内容',
+    stage: 'live',
     turn: 3,
     at: '2026-11-15T00:00:00.000Z',
     ...over,
   }
 }
 
-describe('buildSealEvent', () => {
-  it('产出的 surfaceOp 恰好三个键，符合 isReplaceOp 的严格校验', () => {
-    const [type, data, opts] = buildSealEvent('总结', 10, 20, [10, 11, 12])
-    expect(type).toBe('user/message')
-    expect(data.role).toBe('user')
-    // dsh 的 isReplaceOp 要求 Object.keys(op).length === 3
-    expect(Object.keys(opts.surfaceOp).sort()).toEqual(['endSeq', 'op', 'startSeq'])
-    expect(opts.surfaceOp.op).toBe('replace')
-    expect(opts.surfaceOp.startSeq).toBe(10)
-    expect(opts.surfaceOp.endSeq).toBe(20)
+describe('槽位组装', () => {
+  it('两个槽都输出，各自带标签', () => {
+    const text = composeSlottedText([
+      { kind: 'recent', text: '原文' },
+      { kind: 'summary', text: '总结' },
+    ])
+    expect(text).toContain(`<${SLOT_TAGS.recent}>`)
+    expect(text).toContain('原文')
+    expect(text).toContain(`</${SLOT_TAGS.recent}>`)
+    expect(text).toContain(`<${SLOT_TAGS.summary}>`)
+    expect(text).toContain('总结')
   })
 
-  it('sourceEventSeqs 必须带上，且按升序去重（dsh 强制要求）', () => {
-    const [, , opts] = buildSealEvent('x', 10, 20, [12, 10, 11, 11])
-    expect(opts.sourceEventSeqs).toEqual([10, 11, 12])
+  it('空槽不输出（archived 阶段只有 summary）', () => {
+    const text = composeSlottedText([
+      { kind: 'recent', text: '' },
+      { kind: 'summary', text: '只有总结' },
+    ])
+    expect(text).not.toContain(SLOT_TAGS.recent)
+    expect(text).toContain(SLOT_TAGS.summary)
   })
 
-  it('没有遮蔽节点时拒绝构造（否则 replace 会被 dsh 拒绝）', () => {
-    expect(() => buildSealEvent('x', 10, 20, [])).toThrow(/at least one shadowed/)
+  it('全空时报错（不能产出空段）', () => {
+    expect(() => composeSlottedText([
+      { kind: 'recent', text: '  ' },
+      { kind: 'summary', text: '' },
+    ])).toThrow(/at least one non-empty/)
   })
 
-  it('source.kind 用自定义标记，便于识别这不是用户真的说的话', () => {
-    const [, data] = buildSealEvent('x', 1, 2, [1])
-    expect(data.source.kind).toBe('memory-seal')
-  })
-
-  it('总结文本原样进入 content', () => {
-    const [, data] = buildSealEvent('这是总结', 1, 2, [1])
-    expect(data.content[0].text).toBe('这是总结')
+  it('isSlottedText 能识别已包装的文本', () => {
+    const text = composeSlottedText([{ kind: 'summary', text: 'x' }])
+    expect(isSlottedText(text)).toBe(true)
+    expect(isSlottedText('普通文本')).toBe(false)
   })
 })
 
-describe('SealStore', () => {
-  let store: SealStore
+describe('总结阈值', () => {
+  it('很短 → 保持原文', () => {
+    expect(decideSummarize(500).kind).toBe('keep-original')
+  })
+
+  it('中等 → 可选', () => {
+    expect(decideSummarize(2000).kind).toBe('optional')
+  })
+
+  it('较长 → 应当总结', () => {
+    expect(decideSummarize(10000).kind).toBe('should-summarize')
+  })
+
+  it('阈值可覆盖', () => {
+    expect(decideSummarize(3000, { keep: 5000 }).kind).toBe('keep-original')
+    expect(decideSummarize(3000, { summarize: 2000 }).kind).toBe('should-summarize')
+  })
+})
+
+describe('提炼提示', () => {
+  const prompt = buildSummarizePrompt(50000)
+
+  it('明确要求保留否决路径（用户的核心要求）', () => {
+    expect(prompt).toContain('否决')
+    expect(prompt).toContain('不是压缩')
+  })
+
+  it('给出期望的形态示例', () => {
+    expect(prompt).toContain('最终方案')
+    expect(prompt).toMatch(/否决方案 A/)
+  })
+
+  it('包含长度信息', () => {
+    expect(prompt).toContain('50000')
+  })
+})
+
+describe('SegmentStore', () => {
+  let store: SegmentStore
+  let db: ReturnType<typeof DatabaseConstructor>
   beforeEach(() => {
-    store = new SealStore(memoryDb())
+    db = DatabaseConstructor(':memory:')
+    store = new SegmentStore(db)
+  })
+  afterEach(() => {
+    db.close()
   })
 
-  it('插入后能读回，字段完整', () => {
-    store.insert(segment())
-    const got = store.get('seal-test-1')
-    expect(got?.summary).toContain('登录超时')
-    expect(got?.fromSeq).toBe(10)
-    expect(got?.turn).toBe(3)
+  it('编号从 1 开始递增', () => {
+    expect(store.insert(seg({ fromSeq: 1, toSeq: 5 }))).toBe(1)
+    expect(store.insert(seg({ fromSeq: 6, toSeq: 9 }))).toBe(2)
   })
 
-  it('list 按 turn 升序返回该会话的全部段', () => {
-    store.insert(segment({ id: 'a', turn: 5, fromSeq: 50, toSeq: 60 }))
-    store.insert(segment({ id: 'b', turn: 2, fromSeq: 20, toSeq: 30 }))
-    const list = store.list('session-a')
-    expect(list.map(s => s.id)).toEqual(['b', 'a'])
+  it('编号按会话独立', () => {
+    expect(store.insert(seg({ sessionId: 'a', fromSeq: 1, toSeq: 5 }))).toBe(1)
+    expect(store.insert(seg({ sessionId: 'b', fromSeq: 1, toSeq: 5 }))).toBe(1)
+    expect(store.insert(seg({ sessionId: 'a', fromSeq: 6, toSeq: 9 }))).toBe(2)
   })
 
-  it('不返回其它会话的段', () => {
-    store.insert(segment({ id: 'a', sessionId: 'session-a' }))
-    store.insert(segment({ id: 'b', sessionId: 'session-b' }))
-    expect(store.list('session-a').map(s => s.id)).toEqual(['a'])
+  it('能按 (sessionId, eventNo) 读回', () => {
+    const no = store.insert(seg())
+    const got = store.get('session-a', no)
+    expect(got?.summary).toContain('否决 A')
+    expect(got?.recent).toBe('近期的原文内容')
+    expect(got?.stage).toBe('live')
+    expect(got?.shadowedSeqs).toEqual([10, 11, 12])
   })
 
-  it('findOverlapping 能发现区间重叠（含边界相接）', () => {
-    store.insert(segment({ fromSeq: 10, toSeq: 20 }))
-    expect(store.findOverlapping('session-a', 15, 25)?.id).toBe('seal-test-1')
-    expect(store.findOverlapping('session-a', 1, 10)?.id).toBe('seal-test-1')
+  it('archive 清空 recent 并改阶段', () => {
+    const no = store.insert(seg())
+    expect(store.archive('session-a', no)).toBe(true)
+    const got = store.get('session-a', no)
+    expect(got?.stage).toBe('archived')
+    expect(got?.recent).toBe('')
+    expect(got?.summary).toContain('否决 A')
+  })
+
+  it('findOverlapping 能发现区间重叠', () => {
+    store.insert(seg({ fromSeq: 10, toSeq: 20 }))
+    expect(store.findOverlapping('session-a', 15, 25)?.eventNo).toBe(1)
+    expect(store.findOverlapping('session-a', 1, 10)?.eventNo).toBe(1)
     expect(store.findOverlapping('session-a', 21, 30)).toBeUndefined()
   })
 
-  it('lastSealedTurn 返回最大 turn', () => {
-    store.insert(segment({ id: 'a', turn: 2, fromSeq: 1, toSeq: 5 }))
-    store.insert(segment({ id: 'b', turn: 7, fromSeq: 6, toSeq: 9 }))
-    expect(store.lastSealedTurn('session-a')).toBe(7)
+  it('listLive 只返回 live 阶段的段', () => {
+    const a = store.insert(seg({ fromSeq: 1, toSeq: 5 }))
+    store.insert(seg({ fromSeq: 6, toSeq: 9 }))
+    store.archive('session-a', a)
+    expect(store.listLive('session-a')).toHaveLength(1)
+    expect(store.list('session-a')).toHaveLength(2)
   })
 
-  it('stats 统计段数与会话数', () => {
-    store.insert(segment({ id: 'a', sessionId: 's1', fromSeq: 1, toSeq: 5 }))
-    store.insert(segment({ id: 'b', sessionId: 's2', fromSeq: 1, toSeq: 5 }))
-    expect(store.stats()).toEqual({ count: 2, sessions: 2 })
-  })
-})
-
-describe('shouldSeal', () => {
-  it('只有超过 keepTurns 才允许封存', () => {
-    expect(shouldSeal({ turn: 3 }, 10, 5)).toBe(true)
-    expect(shouldSeal({ turn: 6 }, 10, 5)).toBe(false)
-    expect(shouldSeal({ turn: 5 }, 10, 5)).toBe(true)
+  it('stats 统计 live 与总数', () => {
+    const a = store.insert(seg({ fromSeq: 1, toSeq: 5 }))
+    store.insert(seg({ fromSeq: 6, toSeq: 9 }))
+    store.archive('session-a', a)
+    expect(store.stats('session-a')).toEqual({ total: 2, live: 1, sessions: 1 })
   })
 })
 
-describe('formatSealSummary', () => {
-  it('带机器可读头部，模型能识别这是封存段', () => {
-    const text = formatSealSummary({
-      summary: '结论是 A',
-      reason: '已验证',
-      fromSeq: 10,
-      toSeq: 20,
-      turn: 3,
-    })
-    expect(text).toContain('[sealed segment')
-    expect(text).toContain('seq 10–20')
-    expect(text).toContain('sealed because: 已验证')
-    expect(text).toContain('结论是 A')
+describe('collectShadowedSeqs', () => {
+  it('只取区间内带 surfaceOp 的节点', () => {
+    const session = {
+      snapshotEvents: () => [
+        { seq: 5, surfaceOp: 'append' },
+        { seq: 10, surfaceOp: 'append' },
+        { seq: 11, surfaceOp: 'append' },
+        { seq: 20, surfaceOp: 'append' },
+        { seq: 25, surfaceOp: 'append' },
+      ],
+    }
+    expect(collectShadowedSeqs(session, 10, 20)).toEqual([10, 11, 20])
+  })
+
+  it('去重并升序', () => {
+    const session = {
+      snapshotEvents: () => [
+        { seq: 12, surfaceOp: 'append' },
+        { seq: 10, surfaceOp: 'append' },
+        { seq: 11, surfaceOp: 'append' },
+        { seq: 11, surfaceOp: 'append' },
+      ],
+    }
+    expect(collectShadowedSeqs(session, 10, 12)).toEqual([10, 11, 12])
+  })
+
+  it('区间内无节点时返回 undefined', () => {
+    const session = { snapshotEvents: () => [{ seq: 99, surfaceOp: 'append' }] }
+    expect(collectShadowedSeqs(session, 10, 20)).toBeUndefined()
   })
 })
 
-describe('applySeal', () => {
-  it('拿不到会话时抛错，不静默成功', () => {
+describe('applySegment', () => {
+  it('会话不可达时抛错', () => {
     const fakeCtx = { sessions: { get: () => undefined } } as never
-    expect(() => applySeal(fakeCtx, segment())).toThrow(/not reachable/)
+    expect(() => applySegment(fakeCtx, {
+      eventNo: 1, ...seg(),
+    })).toThrow(/not reachable/)
   })
 
-  it('区间内没有 surface 节点时拒绝，不做空替换', () => {
+  it('区间内无可见节点时拒绝', () => {
     const fakeCtx = {
-      sessions: {
-        get: () => ({
-          append: () => {},
-          snapshotEvents: () => [],
-        }),
-      },
+      sessions: { get: () => ({ append: () => {}, snapshotEvents: () => [] }) },
     } as never
-    expect(() => applySeal(fakeCtx, segment())).toThrow(/nothing would be shadowed/)
+    expect(() => applySegment(fakeCtx, { eventNo: 1, ...seg() })).toThrow(/nothing would be shadowed/)
   })
 
-  it('会话可达时用正确的 surfaceOp + sourceEventSeqs 调用 append', () => {
-    const calls: Array<{ type: string; opts: unknown }> = []
+  it('用正确的 surfaceOp + sourceEventSeqs 调用 append', () => {
+    const calls: Array<{ type: string; data: unknown; opts: unknown }> = []
     const fakeCtx = {
       sessions: {
         get: () => ({
-          append: (type: string, _data: unknown, opts: unknown) => {
-            calls.push({ type, opts })
-          },
-          // 只列出落在 [fromSeq, toSeq] 内、且带 surfaceOp 的节点
+          append: (type: string, data: unknown, opts: unknown) => { calls.push({ type, data, opts }) },
           snapshotEvents: () => [
-            { seq: 5, surfaceOp: 'append' },
             { seq: 10, surfaceOp: 'append' },
             { seq: 11, surfaceOp: 'append' },
-            { seq: 20, surfaceOp: 'append' },
-            { seq: 25, surfaceOp: 'append' },
+            { seq: 12, surfaceOp: 'append' },
           ],
         }),
       },
     } as never
-    applySeal(fakeCtx, segment())
+
+    applySegment(fakeCtx, { eventNo: 1, ...seg() })
     expect(calls).toHaveLength(1)
     expect(calls[0].type).toBe('user/message')
     expect(calls[0].opts).toMatchObject({
       surfaceOp: { op: 'replace', startSeq: 10, endSeq: 20 },
-      sourceEventSeqs: [10, 11, 20],
+      sourceEventSeqs: [10, 11, 12],
     })
+    // 正文里两槽都在
+    const text = (calls[0].data as { content: Array<{ text: string }> }).content[0].text
+    expect(text).toContain(SLOT_TAGS.recent)
+    expect(text).toContain(SLOT_TAGS.summary)
+  })
+
+  it('archived 段只输出 summary 槽', () => {
+    const calls: Array<{ data: unknown }> = []
+    const fakeCtx = {
+      sessions: {
+        get: () => ({
+          append: (_t: string, data: unknown) => { calls.push({ data }) },
+          snapshotEvents: () => [{ seq: 10, surfaceOp: 'append' }],
+        }),
+      },
+    } as never
+
+    applySegment(fakeCtx, { eventNo: 1, ...seg({ recent: '', stage: 'archived' }) })
+    const text = (calls[0].data as { content: Array<{ text: string }> }).content[0].text
+    expect(text).not.toContain(SLOT_TAGS.recent)
+    expect(text).toContain(SLOT_TAGS.summary)
   })
 })

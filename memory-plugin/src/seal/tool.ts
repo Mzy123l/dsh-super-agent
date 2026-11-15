@@ -1,75 +1,91 @@
-// `memory_seal` 工具：模型主动封存一段对话，并留下自己的总结。
+// `memory_summarize` 工具：让模型对一段历史做**提炼**。
 //
-// 这是「近几步全量 + 总结」里**总结**的产生点。
+// ===========================================================================
+// 这不是压缩
+// ===========================================================================
 //
-// 为什么是工具而不是自动触发：
-// - 用户明确要求「不做自动触发」
-// - 只有模型自己知道「这一段是不是真的结束了、有没有值得留下的结论」
+// 用户原话：
+//   「你需要提炼出那一段的有效信息，丢弃噪音，注意不是压缩，而是提炼出有效信息，
+//     比如模型思考了一大坨几十万字，其中否定了很多方案，得出了最终方案，
+//     我期望的结果是：
+//       否决方案：xxx 因为：xxx
+//       ...
+//       最终方案：xxx
+//     这样，而不是直接变成最终方案 xxx」
 //
-// 封存动作有两步（必须原子，否则会丢总结或丢历史）：
-// 1. 把 SealedSegment 写进自己的 SQLite（总结永远留存）
-// 2. 向会话 append 一条 `surfaceOp: replace` 事件（把旧历史换成总结）
+// 所以提炼的产出必须**保留否决路径**。
+//
+// ===========================================================================
+// 什么时候用
+// ===========================================================================
+//
+// 由模型自己判断（不做程序化触发）。长度只作为建议：
+//   - 很短 → 建议不总结，原文直接留
+//   - 中等 → 由模型自己决定
+//   - 较长 → 建议总结
+//
+// 提示词只出现一次，提炼后被遮蔽（见 apply.ts 的 hidePromptAfterUse）。
 
-import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { SealStore } from './store.js'
-import type { SealedSegment } from './types.js'
+import type { SegmentStore } from './store.js'
+import type { Segment } from './types.js'
+import { decideSummarize, buildSummarizePrompt } from './types.js'
+import { applySegment } from './apply.js'
 
-/** 工具执行所需的上下文能力（收窄接口，便于单测）。 */
-export interface SealToolHost {
-  /** 封存段仓储。 */
-  readonly store: SealStore
-  /** 取会话的 append 能力；拿不到时返回 undefined。 */
-  appendToSession(sessionId: string, event: unknown): void
-  /** 该会话当前最新轮次（用于写进 segment）。 */
+/** 工具需要的宿主能力（收窄，便于单测）。 */
+export interface SummarizeHost {
+  readonly store: SegmentStore
+  /** 该会话当前最新轮次。 */
   latestTurn(sessionId: string): number
-  /** 保留原文的轮次数。 */
-  keepTurns: number
+  /** 把段应用到会话表面。 */
+  apply(ctx: Context, segment: Segment): void
   /** 诊断日志。 */
   warn(message: string): void
 }
 
 /** 工具参数。 */
-interface SealArgs {
+interface SummarizeArgs {
+  /** 提炼后的有效信息（保留否决路径） */
   summary?: string
-  reason?: string
+  /** 从哪个 seq 开始 */
   from_seq?: number
+  /** 到哪个 seq 结束 */
   to_seq?: number
+  /** 该段原文（近期阶段随 summary 一起保留；省略则只留总结） */
+  recent_text?: string
 }
 
 /**
- * 创建 `memory_seal` 工具定义。
+ * 创建 `memory_summarize` 工具。
  *
- * 参数里的 `from_seq` / `to_seq` 允许模型显式指定要封存的事件范围；
- * 不指定时，封存「当前轮次之前、且尚未封存」的全部范围。
+ * 两阶段使用：
+ * 1. 不带 summary 调用 → 返回「请提炼」的提示与长度建议（模型据此产出总结）
+ * 2. 带上 summary 调用 → 落库并替换历史
  */
-export function createSealTool(host: SealToolHost, ctx: Context) {
+export function createSummarizeTool(host: SummarizeHost, ctx: Context) {
   return defineTool({
-    name: 'memory_seal',
+    name: 'memory_summarize',
     description:
-      'Seal a finished span of this conversation, replacing it with your own summary. '
-      + 'Later turns will see the summary instead of the original messages, which keeps the context small '
-      + 'while preserving what matters. Call it when a topic is genuinely done and you have a conclusion worth keeping. '
-      + 'Do not seal work that is still in progress.',
+      'Summarize a span of this conversation into its essential information. '
+      + 'This is NOT compression: you must keep the rejected paths (what was ruled out and why), '
+      + 'not just the final answer. Call it when a span is done and worth compacting into a durable note. '
+      + 'Call it once without `summary` to get the extraction guidance and a length-based recommendation, '
+      + 'then call it again with `summary` to apply.',
     parameters: {
       summary: {
         type: 'string',
         description:
-          'What this span accomplished: the conclusion, the decisions made, what remains open. '
-          + 'Write it so that a future reader who never saw the original messages can continue the work.',
+          'The extracted essential information. Must keep rejected alternatives with their reasons, '
+          + 'followed by the final decision. Omit on the first call to get the guidance.',
       },
-      reason: {
+      from_seq: { type: 'number', description: 'First event seq of the span to summarize.' },
+      to_seq: { type: 'number', description: 'Last event seq of the span to summarize.' },
+      recent_text: {
         type: 'string',
-        description: 'Why this span can be sealed now, e.g. "the fix is verified" or "the user moved to another topic".',
-      },
-      from_seq: {
-        type: 'number',
-        description: 'First event seq to seal. Omit to seal everything before the current turn that is not sealed yet.',
-      },
-      to_seq: {
-        type: 'number',
-        description: 'Last event seq to seal. Omit together with from_seq to use the automatic range.',
+        description:
+          'The verbatim text of the span. Keep it when the span is recent so both original and summary are visible. '
+          + 'Omit for older spans that should keep only the summary.',
       },
     },
     output: {
@@ -77,98 +93,100 @@ export function createSealTool(host: SealToolHost, ctx: Context) {
         type: 'object',
         additionalProperties: false,
         properties: {
-          sealed: { type: 'boolean', required: true },
-          segmentId: { type: 'string' },
-          fromSeq: { type: 'number' },
-          toSeq: { type: 'number' },
-          summaryChars: { type: 'number' },
+          ok: { type: 'boolean', required: true },
+          phase: { type: 'string', required: true },
+          guidance: { type: 'string' },
+          recommendation: { type: 'string' },
+          segmentNo: { type: 'number' },
           error: { type: 'string' },
         },
       },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
-    async execute(args: SealArgs, exec: { agent?: { session?: { id?: string } } }) {
+    async execute(args: SummarizeArgs, exec: { agent?: { session?: { id?: string } } }) {
       const sessionId = exec.agent?.session?.id
       if (typeof sessionId !== 'string' || sessionId.length === 0) {
-        return { sealed: false, error: 'no calling session' }
-      }
-
-      const summary = typeof args.summary === 'string' ? args.summary.trim() : ''
-      const reason = typeof args.reason === 'string' ? args.reason.trim() : ''
-      if (summary.length === 0) {
-        // 空总结会让历史直接消失，必须拒绝。
-        return { sealed: false, error: 'summary must not be empty' }
+        return { ok: false, phase: 'error', error: 'no calling session' }
       }
 
       const fromSeq = typeof args.from_seq === 'number' ? args.from_seq : undefined
       const toSeq = typeof args.to_seq === 'number' ? args.to_seq : undefined
-      if ((fromSeq === undefined) !== (toSeq === undefined)) {
-        return { sealed: false, error: 'from_seq and to_seq must be given together' }
+      if (fromSeq === undefined || toSeq === undefined) {
+        // 不给区间就不知道要总结哪一段——拒绝而不是猜。
+        return { ok: false, phase: 'error', error: 'from_seq and to_seq are required' }
+      }
+      if (toSeq < fromSeq) {
+        return { ok: false, phase: 'error', error: 'to_seq must not be less than from_seq' }
       }
 
-      try {
-        const turn = host.latestTurn(sessionId)
+      const summary = typeof args.summary === 'string' ? args.summary.trim() : ''
 
-        // 区间未显式给出时，拒绝而不是猜——猜错会遮蔽掉不该封存的内容。
-        if (fromSeq === undefined || toSeq === undefined) {
+      // ---------- 第一阶段：只给指导，不落库 ----------
+      if (summary.length === 0) {
+        // 估算该段字符数：优先用调用方给的 recent_text，否则按事件数粗估。
+        const charsHint = typeof args.recent_text === 'string' ? args.recent_text.length : (toSeq - fromSeq + 1) * 200
+        const decision = decideSummarize(charsHint)
+        return {
+          ok: true,
+          phase: 'guidance',
+          guidance: buildSummarizePrompt(charsHint),
+          recommendation: `${decision.kind}: ${decision.reason}`,
+        }
+      }
+
+      // ---------- 第二阶段：落库并应用 ----------
+      try {
+        const overlap = host.store.findOverlapping(sessionId, fromSeq, toSeq)
+        if (overlap) {
           return {
-            sealed: false,
-            error:
-              'explicit from_seq and to_seq are required; '
-              + 'read the session log or use the automatic range reported by the plugin',
+            ok: false,
+            phase: 'error',
+            error: `range overlaps existing segment #${overlap.eventNo}`,
           }
         }
-        if (toSeq < fromSeq) {
-          return { sealed: false, error: 'to_seq must not be less than from_seq' }
-        }
 
-        // 防重复：同一区间被封存两次会让历史被二次遮蔽，无法回滚。
-        const overlapping = host.store.findOverlapping(sessionId, fromSeq, toSeq)
-        if (overlapping) {
-          return { sealed: false, error: `range overlaps already sealed segment ${overlapping.id}` }
-        }
+        const recent = typeof args.recent_text === 'string' ? args.recent_text : ''
+        const stage = recent.trim().length > 0 ? 'live' : 'archived'
 
-        const segment: SealedSegment = {
-          id: `seal-${randomUUID()}`,
+        const eventNo = host.store.insert({
           sessionId,
           fromSeq,
           toSeq,
+          shadowedSeqs: [], // 应用时由 collectShadowedSeqs 从真实 surface 补齐
           summary,
-          reason,
-          turn,
+          recent,
+          stage,
+          turn: host.latestTurn(sessionId),
           at: new Date().toISOString(),
+        })
+
+        const segment = host.store.get(sessionId, eventNo)
+        if (!segment) {
+          return { ok: false, phase: 'error', error: 'segment vanished after insert' }
         }
 
-        // 先落库：总结是唯一不可再生的东西，先保证它活着。
-        host.store.insert(segment)
-
-        // 再替换 surface。失败时总结仍在库里，可以在下一轮重试替换。
         try {
-          host.appendToSession(sessionId, segment)
+          host.apply(ctx, segment)
         } catch (error) {
-          host.warn(`memory_seal: surface replace failed for ${segment.id}: ${String(error)}`)
+          // 段已落库：总结是唯一不可再生的东西，先保住它。
+          host.warn(`memory_summarize: apply failed for segment #${eventNo}: ${String(error)}`)
           return {
-            sealed: false,
-            segmentId: segment.id,
+            ok: false,
+            phase: 'stored-not-applied',
+            segmentNo: eventNo,
             error: `summary stored but history replacement failed: ${String(error)}`,
           }
         }
 
-        return {
-          sealed: true,
-          segmentId: segment.id,
-          fromSeq,
-          toSeq,
-          summaryChars: summary.length,
-        }
+        return { ok: true, phase: 'applied', segmentNo: eventNo }
       } catch (error) {
-        host.warn(`memory_seal failed: ${String(error)}`)
-        return { sealed: false, error: String(error) }
+        host.warn(`memory_summarize failed: ${String(error)}`)
+        return { ok: false, phase: 'error', error: String(error) }
       }
     },
-    presentCall: (args: SealArgs) => ({
+    presentCall: (args: SummarizeArgs) => ({
       card: 'generic',
-      title: 'memory_seal',
+      title: 'memory_summarize',
       rawInput: args,
     }),
   })

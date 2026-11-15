@@ -1,17 +1,23 @@
-// SQLite 存储层（better-sqlite3，FTS5 内置）。
-// schema.sql 是唯一权威建表语句；本模块只做读写与 FTS 维护。
+// SQLite 存储层。
+//
+// 核心约定（见 schema.sql）：
+//   * **每个事件都有自己的编号 `event_no`，且编号在每个会话内独立递增**（从 1 开始）。
+//     会话 A 的 #1 与会话 B 的 #1 是不同事件；唯一定位需要 (sessionId, event_no)。
+//   * 消息 / 工具调用 / 工具结果 / 思考 / 压缩摘要——每条都占一个 event_no。
+//   * 内部行号 `row_id` 只给 FTS 当 rowid 用，不对外暴露。
 
 import DatabaseConstructor from 'better-sqlite3'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type {
+  EventKind,
+  EventRecord,
+  EventSearchResult,
   IndexStatus,
-  MemoryRecord,
-  ReasoningRecord,
+  KeywordHit,
   SessionWatermark,
 } from '../types.js'
-import type { KeywordHit } from '../search/keyword.js'
 import { segmentForFts } from '../search/segment.js'
 
 type BetterSqlite3 = ReturnType<typeof DatabaseConstructor>
@@ -19,30 +25,47 @@ type SqliteStatement = import('better-sqlite3').Statement<unknown[], unknown>
 
 /** 定位 schema.sql：优先源码目录，构建后在 dist/store/ */
 function schemaPath(): string {
-  // 本文件构建后在 dist/store/sqlite.js，schema.sql 同目录
   const here = dirname(fileURLToPath(import.meta.url))
-  for (const candidate of [join(here, 'schema.sql'), join(here, '../../src/store/schema.sql')]) {
-    if (existsSync(candidate)) return candidate
+  const candidates = [
+    join(here, 'schema.sql'),
+    join(here, '..', '..', 'src', 'store', 'schema.sql'),
+  ]
+  for (const path of candidates) {
+    if (existsSync(path)) return path
   }
-  throw new Error('schema.sql not found next to store module')
+  throw new Error(`schema.sql not found near ${here}`)
 }
 
+/** 打开选项。 */
 export interface OpenOptions {
   /** :memory: 用于测试 */
   path?: string
 }
 
-/** 记录存储：records / reasoning / records_fts / watermarks / meta */
+/** event 表联查正文后的行。 */
+interface EventRow {
+  row_id: number
+  event_no: number
+  sessionId: string
+  seq: number
+  kind: string
+  at: string
+  turn: number | null
+  shadowed: number
+  text: string | null
+}
+
+/** 记录存储：event / event_text / event_fts / seal / watermark / meta */
 export class MemoryStore {
-  private db: BetterSqlite3
-  private dbPath: string
-  private insertRecordStmt: SqliteStatement
-  private insertFtsStmt: SqliteStatement
-  private insertReasoningStmt: SqliteStatement
-  private deleteFtsByRowidStmt: SqliteStatement
-  private insertFtsMapStmt: SqliteStatement
-  private getFtsMapStmt: SqliteStatement
-  private deleteFtsMapStmt: SqliteStatement
+  private readonly db: BetterSqlite3
+  private readonly dbPath: string
+
+  private readonly stmtUpsertEvent: SqliteStatement
+  private readonly stmtFindEvent: SqliteStatement
+  private readonly stmtNextEventNo: SqliteStatement
+  private readonly stmtUpsertText: SqliteStatement
+  private readonly stmtInsertFts: SqliteStatement
+  private readonly stmtDeleteFts: SqliteStatement
 
   constructor(options: OpenOptions = {}) {
     this.dbPath = options.path ?? ':memory:'
@@ -52,338 +75,327 @@ export class MemoryStore {
     this.db = DatabaseConstructor(this.dbPath)
     this.db.pragma('journal_mode = WAL')
     this.migrate()
-    // 预编译语句（写库热路径；better-sqlite3 的 prepare 开销在 8 万+ 记录时不可忽视）
-    this.insertRecordStmt = this.db.prepare(
-      `INSERT OR REPLACE INTO records (sessionId, seq, kind, at, turn, text, shadowed)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+
+    // 幂等写入：同一 (sessionId, seq, kind) 更新内容，event_no 保持不变。
+    this.stmtUpsertEvent = this.db.prepare(
+      `INSERT INTO event (event_no, sessionId, seq, kind, at, turn, shadowed)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (sessionId, seq, kind) DO UPDATE SET
+         at = excluded.at, turn = excluded.turn, shadowed = excluded.shadowed`,
     )
-    this.insertFtsStmt = this.db.prepare(
-      `INSERT INTO records_fts (text, sessionId, seq, kind, at) VALUES (?, ?, ?, ?, ?)`,
+    // 按自然键查已有行的内部 id 与会话内编号
+    this.stmtFindEvent = this.db.prepare(
+      `SELECT row_id, event_no FROM event WHERE sessionId = ? AND seq = ? AND kind = ?`,
     )
-    this.insertReasoningStmt = this.db.prepare(
-      `INSERT OR REPLACE INTO reasoning (sessionId, seq, at, turn, text) VALUES (?, ?, ?, ?, ?)`,
+    // 该会话下一个可用的 event_no（会话内独立递增）
+    this.stmtNextEventNo = this.db.prepare(
+      `SELECT IFNULL(MAX(event_no), 0) + 1 AS next FROM event WHERE sessionId = ?`,
     )
-    this.deleteFtsByRowidStmt = this.db.prepare(`DELETE FROM records_fts WHERE rowid = ?`)
-    this.insertFtsMapStmt = this.db.prepare(
-      `INSERT OR REPLACE INTO fts_map (sessionId, seq, kind, ftsRowid) VALUES (?, ?, ?, ?)`,
+    this.stmtUpsertText = this.db.prepare(
+      `INSERT INTO event_text (row_id, text) VALUES (?, ?)
+       ON CONFLICT (row_id) DO UPDATE SET text = excluded.text`,
     )
-    this.getFtsMapStmt = this.db.prepare(
-      `SELECT ftsRowid FROM fts_map WHERE sessionId = ? AND seq = ? AND kind = ?`,
-    )
-    this.deleteFtsMapStmt = this.db.prepare(
-      `DELETE FROM fts_map WHERE sessionId = ? AND seq = ? AND kind = ?`,
-    )
+    this.stmtInsertFts = this.db.prepare(`INSERT INTO event_fts (rowid, text) VALUES (?, ?)`)
+    this.stmtDeleteFts = this.db.prepare(`DELETE FROM event_fts WHERE rowid = ?`)
   }
 
   /** 读 schema.sql 并执行（唯一权威） */
   private migrate(): void {
-    const sql = readFileSync(schemaPath(), 'utf8')
-    this.db.exec(sql)
+    this.db.exec(readFileSync(schemaPath(), 'utf8'))
   }
 
   close(): void {
     this.db.close()
   }
 
-  /**
-   * 暴露底层 SQLite 连接，供同库的其它表（如封存段）复用同一连接。
-   *
-   * 共享连接而不是另开一个：SQLite 的 WAL 模式下多连接写会互相阻塞，
-   * 且封存与索引本就属于同一个插件的状态。
-   */
+  /** 暴露底层连接，供同库的 seal 表复用。 */
   get raw(): ReturnType<typeof DatabaseConstructor> {
     return this.db
   }
 
-  /** 单条写入记录 + FTS（事务外由调用方包批） */
-  insertRecord(record: MemoryRecord, shadowed: boolean): void {
-    this.insertRecordStmt.run(
-      record.sessionId,
-      record.seq,
-      record.kind,
-      record.at,
-      record.turn ?? null,
-      record.text,
-      shadowed ? 1 : 0,
-    )
-    this.insertFts(record)
-  }
-
-  // 预编译语句已在构造函数中初始化（见上）
+  // -------------------------------------------------------------------------
+  // 写入
+  // -------------------------------------------------------------------------
 
   /**
-   * FTS 索引维护（规格 §2.3：records_fts 只含可检索正文）。
-   * 替换走 rowid 精确删除（fts_map 映射），绝不按 UNINDEXED 列 DELETE——
-   * 那是 FTS 全表扫描，8 万+ 记录时 O(n²)（实测教训，见 schema.sql 注释）。
+   * 写入一个事件，返回它在**本会话内**的编号。
+   *
+   * 编号规则：会话内从 1 开始递增，与该会话已有的事件数一致。
+   * 已存在（同 sessionId+seq+kind）则复用原编号，不新增。
+   *
+   * @param event - 事件内容（eventNo 字段忽略）。
+   * @param shadowed - 是否已被压缩遮蔽。
+   * @returns 该事件在会话内的编号。
    */
-  private insertFts(record: MemoryRecord): void {
-    const existing = this.getFtsMapStmt.get(record.sessionId, record.seq, record.kind) as
-      | { ftsRowid: number }
+  insertEvent(event: EventRecord, shadowed: boolean): number {
+    // 先查是否已存在（幂等路径）
+    const existing = this.stmtFindEvent.get(event.sessionId, event.seq, event.kind) as
+      | { row_id: number; event_no: number }
       | undefined
+
+    let rowId: number
+    let eventNo: number
+
     if (existing) {
-      this.deleteFtsByRowidStmt.run(existing.ftsRowid)
+      eventNo = existing.event_no
+      rowId = existing.row_id
+      this.stmtUpsertEvent.run(
+        eventNo,
+        event.sessionId,
+        event.seq,
+        event.kind,
+        event.at,
+        event.turn ?? null,
+        shadowed ? 1 : 0,
+      )
+    } else {
+      const next = this.stmtNextEventNo.get(event.sessionId) as { next: number }
+      eventNo = next.next
+      this.stmtUpsertEvent.run(
+        eventNo,
+        event.sessionId,
+        event.seq,
+        event.kind,
+        event.at,
+        event.turn ?? null,
+        shadowed ? 1 : 0,
+      )
+      const row = this.stmtFindEvent.get(event.sessionId, event.seq, event.kind) as
+        | { row_id: number; event_no: number }
+        | undefined
+      if (!row) throw new Error('event insert did not yield a row_id')
+      rowId = row.row_id
     }
-    // CJK 预处理：汉字逐字分词（unicode61 局限的补偿，见 segment.ts）
-    const info = this.insertFtsStmt.run(
-      segmentForFts(record.text),
-      record.sessionId,
-      record.seq,
-      record.kind,
-      record.at,
+
+    // 正文：所有事件都有
+    this.stmtUpsertText.run(rowId, event.text)
+
+    // FTS：思考不进关键词索引（决策①）
+    this.stmtDeleteFts.run(rowId)
+    if (event.kind !== 'reasoning') {
+      this.stmtInsertFts.run(rowId, segmentForFts(event.text))
+    }
+    return eventNo
+  }
+
+  /** 批量写入（单事务）。 */
+  insertBatch(events: Array<{ event: EventRecord; shadowed: boolean }>): number[] {
+    const tx = this.db.transaction((rows: Array<{ event: EventRecord; shadowed: boolean }>) =>
+      rows.map(({ event, shadowed }) => this.insertEvent(event, shadowed)),
     )
-    this.insertFtsMapStmt.run(record.sessionId, record.seq, record.kind, Number(info.lastInsertRowid))
+    return tx(events)
   }
 
-  insertReasoning(record: ReasoningRecord): void {
-    this.insertReasoningStmt.run(
-      record.sessionId,
-      record.seq,
-      record.at,
-      record.turn ?? null,
-      record.text,
-    )
+  /** 兼容旧名：写入一条事件。 */
+  insertRecord(event: EventRecord, shadowed: boolean): number {
+    return this.insertEvent(event, shadowed)
   }
 
-  /** 查询某 seq 当前是否被压缩遮蔽（决策③标记；以 records 表落库值为准） */
-  isShadowed(sessionId: string, seq: number): boolean {
-    const row = this.db
-      .prepare(`SELECT shadowed FROM records WHERE sessionId = ? AND seq = ? LIMIT 1`)
-      .get(sessionId, seq) as { shadowed: number } | undefined
-    return row?.shadowed === 1
+  /** 兼容旧名：写入一条思考事件（自动补 kind='reasoning'）。 */
+  insertReasoning(event: Omit<EventRecord, 'kind'> & { kind?: EventKind }): number {
+    return this.insertEvent({ ...event, kind: 'reasoning' }, false)
   }
 
-  /** 批量写入（单事务，索引速度关键路径） */
-  insertBatch(
-    records: Array<{ record: MemoryRecord; shadowed: boolean }>,
-    reasoning: ReasoningRecord[],
-  ): void {
-    const tx = this.db.transaction(() => {
-      for (const { record, shadowed } of records) this.insertRecord(record, shadowed)
-      for (const r of reasoning) this.insertReasoning(r)
-    })
-    tx()
-  }
-
-  /** 原生事务（indexer 对单会话整批落库用） */
+  /** 原生事务 */
   transaction<T>(fn: () => T): T {
     return this.db.transaction(fn)()
   }
 
-  /** 按 (sessionId, seq, kind) 取正文（向量回链用） */
-  getRecord(sessionId: string, seq: number, kind: string): MemoryRecord | undefined {
+  // -------------------------------------------------------------------------
+  // 读取
+  // -------------------------------------------------------------------------
+
+  /** 按 (sessionId, event_no) 取事件——这是事件的唯一标识。 */
+  getEvent(sessionId: string, eventNo: number): EventSearchResult | undefined {
     const row = this.db
       .prepare(
-        `SELECT sessionId, seq, kind, at, turn, text, shadowed FROM records
-         WHERE sessionId = ? AND seq = ? AND kind = ?`,
+        `SELECT e.*, t.text FROM event e LEFT JOIN event_text t ON t.row_id = e.row_id
+         WHERE e.sessionId = ? AND e.event_no = ?`,
       )
-      .get(sessionId, seq, kind) as
-      | { sessionId: string; seq: number; kind: string; at: string; turn: number | null; text: string; shadowed: number }
-      | undefined
-    if (!row) return undefined
-    return {
-      sessionId: row.sessionId,
-      seq: row.seq,
-      kind: row.kind as MemoryRecord['kind'],
-      at: row.at,
-      turn: row.turn ?? undefined,
-      text: row.text,
-    }
+      .get(sessionId, eventNo) as EventRow | undefined
+    return row ? toResult(row) : undefined
   }
 
-  /** FTS 关键词查询（keyword.ts 的落地） */
+  /** 按 dsh 的自然键取事件。 */
+  getEventBySeq(sessionId: string, seq: number, kind: string): EventSearchResult | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT e.*, t.text FROM event e LEFT JOIN event_text t ON t.row_id = e.row_id
+         WHERE e.sessionId = ? AND e.seq = ? AND e.kind = ?`,
+      )
+      .get(sessionId, seq, kind) as EventRow | undefined
+    return row ? toResult(row) : undefined
+  }
+
+  /** 兼容旧名。 */
+  getRecord(sessionId: string, seq: number, kind: string): EventSearchResult | undefined {
+    return this.getEventBySeq(sessionId, seq, kind)
+  }
+
+  /** 兼容旧名：按内部 row_id 取（FTS 回链用）。 */
+  getRecordByRowId(rowId: number): EventSearchResult | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT e.*, t.text FROM event e LEFT JOIN event_text t ON t.row_id = e.row_id
+         WHERE e.row_id = ?`,
+      )
+      .get(rowId) as EventRow | undefined
+    return row ? toResult(row) : undefined
+  }
+
+  /** 兼容旧名：取思考事件。 */
+  getReasoning(sessionId: string, seq: number): EventSearchResult | undefined {
+    return this.getEventBySeq(sessionId, seq, 'reasoning')
+  }
+
+  /** 某条事件当前是否被压缩遮蔽。 */
+  isShadowed(sessionId: string, seq: number): boolean {
+    const row = this.db
+      .prepare(`SELECT shadowed FROM event WHERE sessionId = ? AND seq = ? LIMIT 1`)
+      .get(sessionId, seq) as { shadowed: number } | undefined
+    return row?.shadowed === 1
+  }
+
+  /** 某会话的全部事件编号（升序）。 */
+  listEventNos(sessionId: string): number[] {
+    return (this.db
+      .prepare(`SELECT event_no FROM event WHERE sessionId = ? ORDER BY event_no ASC`)
+      .all(sessionId) as Array<{ event_no: number }>).map(r => r.event_no)
+  }
+
+  /** FTS 关键词查询。 */
   searchFts(query: string, limit: number, orderByTime: boolean): KeywordHit[] {
-    const order = orderByTime ? 'at DESC, rowid DESC' : 'rank'
-    const stmt = this.db.prepare(
-      `SELECT sessionId, seq, kind, at, rank FROM records_fts
-       WHERE records_fts MATCH ?
-       ORDER BY ${order}
-       LIMIT ?`,
-    )
-    const rows = stmt.all(query, limit) as Array<{
-      sessionId: string
-      seq: number
-      kind: string
-      at: string
-      rank: number
-    }>
-    return rows.map((row) => ({
+    const order = orderByTime ? 'e.at DESC, e.event_no DESC' : 'rank'
+    const rows = this.db
+      .prepare(
+        `SELECT e.row_id, e.event_no, e.sessionId, e.seq, e.kind, e.at, rank
+         FROM event_fts
+         JOIN event e ON e.row_id = event_fts.rowid
+         WHERE event_fts MATCH ?
+         ORDER BY ${order}
+         LIMIT ?`,
+      )
+      .all(query, limit) as Array<{
+        row_id: number
+        event_no: number
+        sessionId: string
+        seq: number
+        kind: string
+        at: string
+        rank: number
+      }>
+    return rows.map(row => ({
+      rowId: row.row_id,
+      eventNo: row.event_no,
       sessionId: row.sessionId,
       seq: row.seq,
-      kind: row.kind as MemoryRecord['kind'],
+      kind: row.kind as EventKind,
       at: row.at,
       rank: row.rank,
     }))
   }
 
-  /** FTS snippet（±80 字上下文）；分词索引文本去空格还原汉字序后返回 */
-  snippet(sessionId: string, seq: number, kind: string, query: string): string | undefined {
+  /** FTS snippet；分词索引文本去空格还原汉字序后返回。 */
+  snippet(rowId: number, query: string): string | undefined {
     const row = this.db
-      .prepare(
-        `SELECT snippet(records_fts, 0, '[', ']', '…', 24) AS s
-         FROM records_fts
-         WHERE records_fts MATCH ? AND sessionId = ? AND seq = ? AND kind = ?`,
-      )
-      .get(query, sessionId, seq, kind) as { s: string } | undefined
+      .prepare(`SELECT snippet(event_fts, 0, '[', ']', '…', 24) AS s FROM event_fts WHERE event_fts MATCH ? AND rowid = ?`)
+      .get(query, rowId) as { s: string } | undefined
     if (!row) return undefined
-    // CJK 逐字分词引入的空格去掉，还接近原文；latin 词间空格保留
     return row.s.replace(/([\u4e00-\u9fff\u3400-\u4dbf]) (?=[\u4e00-\u9fff\u3400-\u4dbf])/g, '$1')
   }
 
-  /** reasoning 全量取（向量检索回链用） */
-  getReasoning(sessionId: string, seq: number): ReasoningRecord | undefined {
-    const row = this.db
-      .prepare(`SELECT sessionId, seq, at, turn, text FROM reasoning WHERE sessionId = ? AND seq = ?`)
-      .get(sessionId, seq) as
-      | { sessionId: string; seq: number; at: string; turn: number | null; text: string }
-      | undefined
-    if (!row) return undefined
-    return {
-      sessionId: row.sessionId,
-      seq: row.seq,
-      at: row.at,
-      turn: row.turn ?? undefined,
-      text: row.text,
-    }
-  }
-
-  /** reasoning 按 sessionId 过滤列出（HTTP API 用） */
-  listReasoning(sessionId?: string, limit = 100): ReasoningRecord[] {
-    const rows = (
-      sessionId
-        ? this.db
-            .prepare(`SELECT sessionId, seq, at, turn, text FROM reasoning WHERE sessionId = ? ORDER BY seq DESC LIMIT ?`)
-            .all(sessionId, limit)
-        : this.db
-            .prepare(`SELECT sessionId, seq, at, turn, text FROM reasoning ORDER BY seq DESC LIMIT ?`)
-            .all(limit)
-    ) as Array<{ sessionId: string; seq: number; at: string; turn: number | null; text: string }>
-    return rows.map((row) => ({
-      sessionId: row.sessionId,
-      seq: row.seq,
-      at: row.at,
-      turn: row.turn ?? undefined,
-      text: row.text,
-    }))
-  }
-
-  /** 分页列表（HTTP API /records 用） */
-  listRecords(opts: {
-    sessionId?: string
-    kind?: string
-    q?: string
-    shadowed?: boolean
-    limit?: number
-    offset?: number
-  }): Array<MemoryRecord & { shadowed: boolean }> {
-    const where: string[] = []
+  /** 列出事件（HTTP API 用）。 */
+  listEvents(sessionId: string | undefined, kind: string | undefined, limit: number, offset: number): EventSearchResult[] {
+    const clauses: string[] = []
     const params: unknown[] = []
-    if (opts.sessionId) {
-      where.push('sessionId = ?')
-      params.push(opts.sessionId)
-    }
-    if (opts.kind) {
-      where.push('kind = ?')
-      params.push(opts.kind)
-    }
-    if (opts.shadowed !== undefined) {
-      where.push('shadowed = ?')
-      params.push(opts.shadowed ? 1 : 0)
-    }
-    if (opts.q) {
-      where.push('text LIKE ?')
-      params.push(`%${opts.q}%`)
-    }
-    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
+    if (sessionId) { clauses.push('e.sessionId = ?'); params.push(sessionId) }
+    if (kind) { clauses.push('e.kind = ?'); params.push(kind) }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
     const rows = this.db
       .prepare(
-        `SELECT sessionId, seq, kind, at, turn, text, shadowed FROM records
-         ${whereSql} ORDER BY sessionId, seq LIMIT ? OFFSET ?`,
+        `SELECT e.*, t.text FROM event e LEFT JOIN event_text t ON t.row_id = e.row_id
+         ${where} ORDER BY e.sessionId ASC, e.event_no ASC LIMIT ? OFFSET ?`,
       )
-      .all(...params, opts.limit ?? 50, opts.offset ?? 0) as Array<{
-      sessionId: string
-      seq: number
-      kind: string
-      at: string
-      turn: number | null
-      text: string
-      shadowed: number
-    }>
-    return rows.map((row) => ({
-      sessionId: row.sessionId,
-      seq: row.seq,
-      kind: row.kind as MemoryRecord['kind'],
-      at: row.at,
-      turn: row.turn ?? undefined,
-      text: row.text,
-      shadowed: row.shadowed === 1,
-    }))
+      .all(...params, limit, offset) as EventRow[]
+    return rows.map(toResult)
   }
 
-  /** 会话水位线（增量索引） */
+  /** 兼容旧名。 */
+  listRecords(sessionId: string | undefined, kind: string | undefined, limit: number, offset: number): EventSearchResult[] {
+    return this.listEvents(sessionId, kind, limit, offset)
+  }
+
+  /** 列出思考事件。 */
+  listReasoning(sessionId: string | undefined, limit: number): EventSearchResult[] {
+    return this.listEvents(sessionId, 'reasoning', limit, 0)
+  }
+
+  // -------------------------------------------------------------------------
+  // 水位线 / 元信息 / 统计
+  // -------------------------------------------------------------------------
+
   getWatermark(sessionId: string): SessionWatermark | undefined {
     const row = this.db
-      .prepare(`SELECT sessionId, lastSeq, indexedAt, eventCount FROM watermarks WHERE sessionId = ?`)
+      .prepare(`SELECT sessionId, lastSeq, indexedAt, eventCount FROM watermark WHERE sessionId = ?`)
       .get(sessionId) as SessionWatermark | undefined
-    return row
+    return row ? { ...row } : undefined
   }
 
-  setWatermark(watermark: SessionWatermark): void {
+  setWatermark(w: SessionWatermark): void {
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO watermarks (sessionId, lastSeq, indexedAt, eventCount) VALUES (?, ?, ?, ?)`,
+        `INSERT INTO watermark (sessionId, lastSeq, last_event_no, indexedAt, eventCount)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (sessionId) DO UPDATE SET
+           lastSeq = excluded.lastSeq, last_event_no = excluded.last_event_no,
+           indexedAt = excluded.indexedAt, eventCount = excluded.eventCount`,
       )
-      .run(watermark.sessionId, watermark.lastSeq, watermark.indexedAt, watermark.eventCount)
+      .run(w.sessionId, w.lastSeq, 0, w.indexedAt, w.eventCount)
   }
 
   listWatermarks(): SessionWatermark[] {
     return this.db
-      .prepare(`SELECT sessionId, lastSeq, indexedAt, eventCount FROM watermarks ORDER BY sessionId`)
+      .prepare(`SELECT sessionId, lastSeq, indexedAt, eventCount FROM watermark ORDER BY sessionId`)
       .all() as SessionWatermark[]
   }
 
   setMeta(key: string, value: string): void {
-    this.db.prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`).run(key, value)
+    this.db
+      .prepare(`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`)
+      .run(key, value)
   }
 
   getMeta(key: string): string | undefined {
-    const row = this.db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as
-      | { value: string }
-      | undefined
+    const row = this.db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as { value: string } | undefined
     return row?.value
   }
 
-  /** 各表计数（status 用） */
-  counts(): {
-    sessions: number
-    records: number
-    reasoning: number
-    summaries: number
-    shadowed: number
-  } {
-    const count = (sql: string): number => {
-      const row = this.db.prepare(sql).get() as { n: number }
-      return row.n
-    }
+  /** 索引状态（status 命令用）。 */
+  status(): IndexStatus {
+    const count = (sql: string): number => (this.db.prepare(sql).get() as { n: number }).n
     return {
-      sessions: count(`SELECT COUNT(DISTINCT sessionId) AS n FROM records`),
-      records: count(`SELECT COUNT(*) AS n FROM records`),
-      reasoning: count(`SELECT COUNT(*) AS n FROM reasoning`),
-      summaries: count(`SELECT COUNT(*) AS n FROM records WHERE kind = 'summary'`),
-      shadowed: count(`SELECT COUNT(*) AS n FROM records WHERE shadowed = 1`),
+      sessions: count(`SELECT COUNT(DISTINCT sessionId) AS n FROM event`),
+      events: count(`SELECT COUNT(*) AS n FROM event`),
+      reasoning: count(`SELECT COUNT(*) AS n FROM event WHERE kind = 'reasoning'`),
+      summaries: count(`SELECT COUNT(*) AS n FROM event WHERE kind = 'summary'`),
+      shadowed: count(`SELECT COUNT(*) AS n FROM event WHERE shadowed = 1`),
+      sealed: count(`SELECT COUNT(*) AS n FROM seal`),
+      lastIndexedAt: this.getMeta('lastIndexedAt') ?? null,
     }
   }
+}
 
-  lastIndexedAt(): string | null {
-    return this.getMeta('lastIndexedAt') ?? null
-  }
-
-  status(vectors: number): IndexStatus {
-    const counts = this.counts()
-    return {
-      ...counts,
-      vectors,
-      lastIndexedAt: this.lastIndexedAt(),
-      watermarks: this.listWatermarks(),
-    }
+/** EventRow → EventSearchResult */
+function toResult(row: EventRow): EventSearchResult {
+  return {
+    rowId: row.row_id,
+    eventNo: row.event_no,
+    sessionId: row.sessionId,
+    seq: row.seq,
+    kind: row.kind as EventKind,
+    at: row.at,
+    turn: row.turn ?? undefined,
+    text: row.text ?? '',
+    shadowed: row.shadowed === 1,
   }
 }

@@ -71,15 +71,15 @@ export function keywordSearch(
 
   const results: MemoryRecordResult[] = []
   for (const hit of hits) {
-    const record = store.getRecord(hit.sessionId, hit.seq, hit.kind)
+    // 用内部 row_id 回链正文（FTS 的 rowid 就是它）
+    const record = store.getRecordByRowId(hit.rowId)
     if (!record) continue
-    const shadowed = store.isShadowed(hit.sessionId, hit.seq)
+    const snippetText = store.snippet(hit.rowId, ftsQuery)
     results.push({
       ...record,
-      shadowed,
       rank: hit.rank,
-      // snippet：FTS5 snippet，查询词高亮
-      text: store.snippet(hit.sessionId, hit.seq, hit.kind, ftsQuery) ?? record.text,
+      // snippet：FTS5 snippet，查询词高亮；取不到时退回正文
+      text: snippetText ?? record.text,
     })
   }
   return results

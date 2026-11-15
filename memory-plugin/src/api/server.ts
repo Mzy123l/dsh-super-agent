@@ -61,15 +61,12 @@ async function handle(
 
   // GET /records?sessionId=&kind=&q=&shadowed=&limit=&offset=
   if (path === '/records' && req.method === 'GET') {
-    const shadowedParam = params.get('shadowed')
-    const records = store.listRecords({
-      sessionId: params.get('sessionId') ?? undefined,
-      kind: params.get('kind') ?? undefined,
-      q: params.get('q') ?? undefined,
-      shadowed: shadowedParam === null ? undefined : shadowedParam === 'true',
-      limit: Number(params.get('limit') ?? 50),
-      offset: Number(params.get('offset') ?? 0),
-    })
+    const records = store.listRecords(
+      params.get('sessionId') ?? undefined,
+      params.get('kind') ?? undefined,
+      Number(params.get('limit') ?? 50),
+      Number(params.get('offset') ?? 0),
+    )
     json(200, { records })
     return
   }
@@ -112,7 +109,7 @@ async function handle(
 
   // GET /status
   if (path === '/status' && req.method === 'GET') {
-    json(200, store.status(vectorStore.count()))
+    json(200, store.status())
     return
   }
 

@@ -130,9 +130,13 @@ export interface VectorHitResult {
 }
 
 /**
- * 解析向量 id 并回链正文：
- * - 'r:...' → records 表（带 shadowed 标记）
- * - 'n:...' → reasoning 表，结果 kind 标记为 'reasoning'
+ * 解析向量 id 并回链正文。
+ *
+ * 向量 id 沿用事件编号体系：`<sessionId>#<eventNo>`。
+ * 一个编号只对应一个事件——不再区分 r:/n: 前缀，
+ * 因为 reasoning 也是一个普通事件（只是不进 FTS）。
+ *
+ * 为兼容旧索引，保留了 `r:` / `n:` 两种历史形态的解析。
  */
 export function resolveVectorHits(
   store: MemoryStore,
@@ -140,40 +144,74 @@ export function resolveVectorHits(
 ): VectorHitResult[] {
   const results: VectorHitResult[] = []
   for (const hit of hits) {
-    if (hit.id.startsWith('n:')) {
-      // n:<sessionId>:<seq>
-      const rest = hit.id.slice(2)
-      const idx = rest.lastIndexOf(':')
-      if (idx < 0) continue
-      const sessionId = rest.slice(0, idx)
-      const seq = Number(rest.slice(idx + 1))
-      const reasoning = store.getReasoning(sessionId, seq)
-      if (!reasoning) continue
-      results.push({
+    const resolved = resolveOne(store, hit)
+    if (resolved) results.push(resolved)
+  }
+  return results
+}
+
+/** 解析单个向量命中。 */
+function resolveOne(
+  store: MemoryStore,
+  hit: { id: VectorRecordId; score: number },
+): VectorHitResult | undefined {
+  // 新格式：<sessionId>#<eventNo>
+  if (!hit.id.startsWith('r:') && !hit.id.startsWith('n:')) {
+    const hash = hit.id.lastIndexOf('#')
+    if (hash < 0) return undefined
+    const sessionId = hit.id.slice(0, hash)
+    const eventNo = Number(hit.id.slice(hash + 1))
+    if (!Number.isInteger(eventNo)) return undefined
+    const event = store.getEvent(sessionId, eventNo)
+    if (!event) return undefined
+    if (event.kind === 'reasoning') {
+      return {
         id: hit.id,
         score: hit.score,
         kind: 'reasoning',
-        reasoning: { ...reasoning, score: hit.score },
-      })
-    } else if (hit.id.startsWith('r:')) {
-      // r:<sessionId>:<seq>:<kind>
-      const rest = hit.id.slice(2)
-      const firstColon = rest.indexOf(':')
-      if (firstColon < 0) continue
-      const secondColon = rest.indexOf(':', firstColon + 1)
-      if (secondColon < 0) continue
-      const sessionId = rest.slice(0, firstColon)
-      const seq = Number(rest.slice(firstColon + 1, secondColon))
-      const kind = rest.slice(secondColon + 1)
-      const record = store.getRecord(sessionId, seq, kind)
-      if (!record) continue
-      results.push({
-        id: hit.id,
-        score: hit.score,
-        kind: record.kind,
-        record: { ...record, shadowed: store.isShadowed(sessionId, seq), score: hit.score },
-      })
+        reasoning: { ...event, score: hit.score },
+      }
+    }
+    return {
+      id: hit.id,
+      score: hit.score,
+      kind: event.kind,
+      record: { ...event, score: hit.score },
     }
   }
-  return results
+
+  // 历史格式：n:<sessionId>:<seq>
+  if (hit.id.startsWith('n:')) {
+    const rest = hit.id.slice(2)
+    const idx = rest.lastIndexOf(':')
+    if (idx < 0) return undefined
+    const sessionId = rest.slice(0, idx)
+    const seq = Number(rest.slice(idx + 1))
+    const reasoning = store.getReasoning(sessionId, seq)
+    if (!reasoning) return undefined
+    return {
+      id: hit.id,
+      score: hit.score,
+      kind: 'reasoning',
+      reasoning: { ...reasoning, score: hit.score },
+    }
+  }
+
+  // 历史格式：r:<sessionId>:<seq>:<kind>
+  const rest = hit.id.slice(2)
+  const firstColon = rest.indexOf(':')
+  if (firstColon < 0) return undefined
+  const secondColon = rest.indexOf(':', firstColon + 1)
+  if (secondColon < 0) return undefined
+  const sessionId = rest.slice(0, firstColon)
+  const seq = Number(rest.slice(firstColon + 1, secondColon))
+  const kind = rest.slice(secondColon + 1)
+  const record = store.getRecord(sessionId, seq, kind)
+  if (!record) return undefined
+  return {
+    id: hit.id,
+    score: hit.score,
+    kind: record.kind,
+    record: { ...record, score: hit.score },
+  }
 }

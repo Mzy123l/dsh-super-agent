@@ -119,6 +119,7 @@ export function extractFromEvents(sessionId: string, events: RawEvent[]): Extrac
           reasoning.push({
             seq: ev.seq,
             sessionId,
+            kind: 'reasoning',
             at,
             turn: turn ?? resolveTurn(turnStarts, ev.seq),
             text: clip(think, TEXT_SLICE),

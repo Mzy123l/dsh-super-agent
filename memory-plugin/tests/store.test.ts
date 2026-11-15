@@ -1,192 +1,169 @@
-// MemoryStore 测试：建表、写入、FTS 维护、水位线、计数、列表过滤
+// 事件存储测试：编号规则、幂等、FTS、水位线。
+//
+// 重点验证「每个事件一个编号，且编号在会话内独立递增」。
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { MemoryStore } from '../src/store/sqlite.js'
-import { buildFtsQuery } from '../src/search/keyword.js'
-import type { MemoryRecord, ReasoningRecord } from '../src/types.js'
+import type { EventRecord } from '../src/types.js'
+import { keywordSearch } from '../src/search/keyword.js'
 
-function record(partial: Partial<MemoryRecord> & { seq: number; kind: MemoryRecord['kind']; text: string }): MemoryRecord {
+/** 造一个事件。 */
+function ev(over: Partial<EventRecord> = {}): EventRecord {
   return {
-    sessionId: 'sess-a',
-    at: new Date(1700000000000 + partial.seq! * 1000).toISOString(),
-    ...partial,
+    sessionId: 'session-a',
+    seq: 1,
+    kind: 'user',
+    at: '2026-11-15T00:00:00.000Z',
+    text: '默认内容',
+    ...over,
   }
 }
 
-function reasoning(partial: Partial<ReasoningRecord> & { seq: number; text: string }): ReasoningRecord {
-  return { sessionId: 'sess-a', at: new Date(1700000000000).toISOString(), ...partial }
-}
-
-describe('MemoryStore', () => {
-  it('建表：内存库可打开且 schema 可执行两次（IF NOT EXISTS）', () => {
-    const store = new MemoryStore()
-    store.close()
-    const store2 = new MemoryStore()
-    store2.close()
+describe('MemoryStore 事件编号', () => {
+  let store: MemoryStore
+  beforeEach(() => {
+    store = new MemoryStore({ path: ':memory:' })
   })
-
-  it('写入记录 + FTS，重复写 REPLACE 不重复', () => {
-    const store = new MemoryStore()
-    const r = record({ seq: 1, kind: 'user', text: '记成待办' })
-    store.insertRecord(r, false)
-    store.insertRecord(r, false) // 同主键再写一次
-    const counts = store.counts()
-    expect(counts.records).toBe(1)
-    expect(counts.sessions).toBe(1)
+  afterEach(() => {
     store.close()
   })
 
-  it('getRecord 回链与 isShadowed', () => {
-    const store = new MemoryStore()
-    store.insertRecord(record({ seq: 5, kind: 'tool-result', text: '结果正文', turn: 3 }), true)
-    const got = store.getRecord('sess-a', 5, 'tool-result')
-    expect(got?.text).toBe('结果正文')
-    expect(got?.turn).toBe(3)
-    expect(store.isShadowed('sess-a', 5)).toBe(true)
-    expect(store.isShadowed('sess-a', 6)).toBe(false)
-    expect(store.getRecord('sess-a', 99, 'user')).toBeUndefined()
+  it('同一会话内编号从 1 开始逐条递增', () => {
+    expect(store.insertEvent(ev({ seq: 1 }), false)).toBe(1)
+    expect(store.insertEvent(ev({ seq: 2 }), false)).toBe(2)
+    expect(store.insertEvent(ev({ seq: 3 }), false)).toBe(3)
+  })
+
+  it('不同会话各自独立编号，互不影响', () => {
+    expect(store.insertEvent(ev({ sessionId: 'a', seq: 1 }), false)).toBe(1)
+    expect(store.insertEvent(ev({ sessionId: 'a', seq: 2 }), false)).toBe(2)
+    // 会话 b 从 1 重新开始
+    expect(store.insertEvent(ev({ sessionId: 'b', seq: 1 }), false)).toBe(1)
+    expect(store.insertEvent(ev({ sessionId: 'b', seq: 2 }), false)).toBe(2)
+    // 回到 a，继续 3
+    expect(store.insertEvent(ev({ sessionId: 'a', seq: 3 }), false)).toBe(3)
+  })
+
+  it('同一 (sessionId, seq, kind) 重复写入复用编号，不新增', () => {
+    const first = store.insertEvent(ev({ seq: 5, text: '第一次' }), false)
+    const second = store.insertEvent(ev({ seq: 5, text: '第二次' }), false)
+    expect(second).toBe(first)
+    expect(store.getEvent('session-a', first)?.text).toBe('第二次')
+  })
+
+  it('同一 seq 的不同 kind 各占一个编号（assistant 正文 + 思考）', () => {
+    const a = store.insertEvent(ev({ seq: 7, kind: 'assistant', text: '正文' }), false)
+    const b = store.insertEvent(ev({ seq: 7, kind: 'reasoning', text: '思考' }), false)
+    expect(a).not.toBe(b)
+  })
+
+  it('按 (sessionId, eventNo) 唯一定位事件', () => {
+    store.insertEvent(ev({ sessionId: 'a', seq: 1, text: 'A1' }), false)
+    store.insertEvent(ev({ sessionId: 'b', seq: 1, text: 'B1' }), false)
+    expect(store.getEvent('a', 1)?.text).toBe('A1')
+    expect(store.getEvent('b', 1)?.text).toBe('B1')
+  })
+})
+
+describe('MemoryStore FTS', () => {
+  let store: MemoryStore
+  beforeEach(() => {
+    store = new MemoryStore({ path: ':memory:' })
+  })
+  afterEach(() => {
     store.close()
   })
 
-  it('insertBatch 事务写入 records + reasoning', () => {
-    const store = new MemoryStore()
-    store.insertBatch(
-      [
-        { record: record({ seq: 1, kind: 'user', text: '第一条' }), shadowed: false },
-        { record: record({ seq: 2, kind: 'assistant', text: '第二条' }), shadowed: true },
-      ],
-      [reasoning({ seq: 2, text: '思考原文' })],
-    )
-    expect(store.counts().records).toBe(2)
-    expect(store.counts().reasoning).toBe(1)
-    expect(store.counts().shadowed).toBe(1)
+  it('能搜到中文（逐字分词补偿）', () => {
+    store.insertEvent(ev({ seq: 1, text: '把这件事记成待办，回头再处理' }), false)
+    const hits = keywordSearch(store, '待办', { limit: 10 })
+    expect(hits.length).toBeGreaterThan(0)
+    expect(hits[0].eventNo).toBe(1)
+  })
+
+  it('思考不进 FTS（决策①）', () => {
+    store.insertEvent(ev({ seq: 1, kind: 'reasoning', text: '这是模型内部思考' }), false)
+    const hits = keywordSearch(store, '内部思考', { limit: 10 })
+    expect(hits).toHaveLength(0)
+  })
+
+  it('FTS 命中能回链到事件正文', () => {
+    store.insertEvent(ev({ seq: 3, text: '关于登录超时的排查记录' }), false)
+    const hits = keywordSearch(store, '登录', { limit: 10 })
+    const event = store.getRecordByRowId(hits[0].rowId)
+    expect(event?.text).toContain('登录超时')
+  })
+
+  it('相同 sessionId+seq 不同 kind 时 FTS 只索引非 reasoning', () => {
+    store.insertEvent(ev({ seq: 9, kind: 'assistant', text: '可见回复内容' }), false)
+    store.insertEvent(ev({ seq: 9, kind: 'reasoning', text: '不可见思考内容' }), false)
+    expect(keywordSearch(store, '可见回复', { limit: 10 })).toHaveLength(1)
+    expect(keywordSearch(store, '不可见思考', { limit: 10 })).toHaveLength(0)
+  })
+})
+
+describe('MemoryStore 水位线与统计', () => {
+  let store: MemoryStore
+  beforeEach(() => {
+    store = new MemoryStore({ path: ':memory:' })
+  })
+  afterEach(() => {
     store.close()
   })
 
-  it('searchFts：英文分词 AND 查询 + rank 排序', () => {
-    const store = new MemoryStore()
-    store.insertRecord(record({ seq: 1, kind: 'user', text: 'fix the timestamp bug please' }), false)
-    store.insertRecord(record({ seq: 2, kind: 'assistant', text: 'the timestamp is wrong in log' }), false)
-    store.insertRecord(record({ seq: 3, kind: 'user', text: 'unrelated content' }), false)
-    const hits = store.searchFts('"timestamp"', 10, false)
-    expect(hits).toHaveLength(2)
-    expect(hits.every((h) => typeof h.rank === 'number')).toBe(true)
-    store.close()
+  it('水位线可写入并读回', () => {
+    store.setWatermark({
+      sessionId: 'a',
+      lastSeq: 42,
+      indexedAt: '2026-11-15T00:00:00.000Z',
+      eventCount: 100,
+    })
+    expect(store.getWatermark('a')?.lastSeq).toBe(42)
   })
 
-  it('searchFts：中文经 CJK 分词后命中（字级 phrase）', () => {
-    const store = new MemoryStore()
-    store.insertRecord(record({ seq: 1, kind: 'user', text: '这个日志时间戳不对，记成待办' }), false)
-    // 查询侧走 buildFtsQuery 的 CJK 单字 phrase（与 keywordSearch 同路径）
-    const query = buildFtsQuery('日志时间戳不对')!
-    const hits = store.searchFts(query, 10, false)
-    expect(hits).toHaveLength(1)
-    expect(hits[0]?.seq).toBe(1)
-    store.close()
-  })
-
-  it('searchFts：按时间排序', () => {
-    const store = new MemoryStore()
-    store.insertRecord(record({ seq: 1, kind: 'user', text: 'alpha topic' }), false)
-    store.insertRecord(record({ seq: 2, kind: 'user', text: 'beta topic', at: new Date(1799999999999).toISOString() }), false)
-    const hits = store.searchFts('"topic"', 10, true)
-    expect(hits[0]?.seq).toBe(2)
-    store.close()
-  })
-
-  it('snippet 返回带高亮标记的上下文（CJK 去空格还原）', () => {
-    const store = new MemoryStore()
-    store.insertRecord(record({ seq: 1, kind: 'user', text: '前面铺垫很长很长很长，关键句在这里：待办事项要记住，后面还有内容' }), false)
-    const query = buildFtsQuery('待办事项')!
-    const snippet = store.snippet('sess-a', 1, 'user', query)
-    expect(snippet).toBeDefined()
-    expect(snippet).toContain('待办事项')
-    store.close()
-  })
-
-  it('reasoning 写入/读取/列出（决策①：与 FTS 隔离）', () => {
-    const store = new MemoryStore()
-    store.insertReasoning(reasoning({ seq: 10, text: '独特思考串：ZX量子QW' }))
-    store.insertRecord(record({ seq: 11, kind: 'user', text: '普通消息' }), false)
-    // reasoning 表里能查到
-    expect(store.getReasoning('sess-a', 10)?.text).toContain('ZX量子QW')
-    // FTS 搜不到 reasoning 原文
-    expect(store.searchFts('"ZX量子QW"', 10, false)).toHaveLength(0)
-    // 列表过滤
-    expect(store.listReasoning('sess-a')).toHaveLength(1)
-    expect(store.listReasoning('sess-b')).toHaveLength(0)
-    store.close()
-  })
-
-  it('listRecords 按 session/kind/shadowed/q 过滤', () => {
-    const store = new MemoryStore()
-    store.insertBatch(
-      [
-        { record: record({ sessionId: 'sess-a', seq: 1, kind: 'user', text: '苹果' }), shadowed: false },
-        { record: record({ sessionId: 'sess-a', seq: 2, kind: 'user', text: '香蕉' }), shadowed: true },
-        { record: record({ sessionId: 'sess-b', seq: 3, kind: 'summary', text: '摘要苹果' }), shadowed: false },
-      ],
-      [],
-    )
-    expect(store.listRecords({ sessionId: 'sess-a' })).toHaveLength(2)
-    expect(store.listRecords({ kind: 'summary' })).toHaveLength(1)
-    expect(store.listRecords({ shadowed: true })).toHaveLength(1)
-    expect(store.listRecords({ q: '苹果' })).toHaveLength(2)
-    expect(store.listRecords({ sessionId: 'sess-a', shadowed: true })).toHaveLength(1)
-    const paged = store.listRecords({ limit: 1, offset: 1 })
-    expect(paged).toHaveLength(1)
-    store.close()
-  })
-
-  it('水位线与 meta', () => {
-    const store = new MemoryStore()
-    expect(store.getWatermark('sess-a')).toBeUndefined()
-    store.setWatermark({ sessionId: 'sess-a', lastSeq: 42, indexedAt: '2026-01-01T00:00:00.000Z', eventCount: 100 })
-    const wm = store.getWatermark('sess-a')
-    expect(wm?.lastSeq).toBe(42)
-    expect(wm?.eventCount).toBe(100)
+  it('同一个会话的水位线更新而非新增', () => {
+    store.setWatermark({ sessionId: 'a', lastSeq: 1, indexedAt: 'x', eventCount: 1 })
+    store.setWatermark({ sessionId: 'a', lastSeq: 9, indexedAt: 'y', eventCount: 2 })
     expect(store.listWatermarks()).toHaveLength(1)
-
-    store.setMeta('lastIndexedAt', '2026-01-02T03:04:05.000Z')
-    expect(store.lastIndexedAt()).toBe('2026-01-02T03:04:05.000Z')
-    store.close()
+    expect(store.getWatermark('a')?.lastSeq).toBe(9)
   })
 
-  it('status 汇总各表计数', () => {
-    const store = new MemoryStore()
-    store.insertBatch(
-      [
-        { record: record({ seq: 1, kind: 'user', text: 'a' }), shadowed: false },
-        { record: record({ seq: 2, kind: 'summary', text: 's' }), shadowed: false },
-        { record: record({ sessionId: 'sess-b', seq: 1, kind: 'user', text: 'b' }), shadowed: true },
-      ],
-      [reasoning({ seq: 1, text: 'r' })],
-    )
-    store.setMeta('lastIndexedAt', '2026-06-01T00:00:00.000Z')
-    const status = store.status(7)
-    expect(status.sessions).toBe(2)
-    expect(status.records).toBe(3)
-    expect(status.reasoning).toBe(1)
-    expect(status.summaries).toBe(1)
-    expect(status.shadowed).toBe(1)
-    expect(status.vectors).toBe(7)
-    expect(status.lastIndexedAt).toBe('2026-06-01T00:00:00.000Z')
-    expect(status.watermarks).toHaveLength(0)
-    store.close()
+  it('status 统计事件与各类子集', () => {
+    store.insertEvent(ev({ seq: 1, kind: 'user' }), false)
+    store.insertEvent(ev({ seq: 2, kind: 'reasoning' }), false)
+    store.insertEvent(ev({ seq: 3, kind: 'summary' }), true)
+    const s = store.status()
+    expect(s.sessions).toBe(1)
+    expect(s.events).toBe(3)
+    expect(s.reasoning).toBe(1)
+    expect(s.summaries).toBe(1)
+    expect(s.shadowed).toBe(1)
   })
 
-  it('文件库：数据目录自动创建并持久化', async () => {
-    const { mkdtempSync } = await import('node:fs')
-    const { tmpdir } = await import('node:os')
-    const { join } = await import('node:path')
-    const dir = mkdtempSync(join(tmpdir(), 'memory-plugin-store-'))
-    const dbPath = join(dir, 'nested', 'memory.sqlite')
-    const store = new MemoryStore({ path: dbPath })
-    store.insertRecord(record({ seq: 1, kind: 'user', text: '持久化' }), false)
-    store.close()
-    // 重开还能读到
-    const store2 = new MemoryStore({ path: dbPath })
-    expect(store2.getRecord('sess-a', 1, 'user')?.text).toBe('持久化')
-    store2.close()
+  it('列出某会话的事件编号', () => {
+    store.insertEvent(ev({ seq: 1 }), false)
+    store.insertEvent(ev({ seq: 2 }), false)
+    expect(store.listEventNos('session-a')).toEqual([1, 2])
+  })
+})
+
+describe('MemoryStore 持久化', () => {
+  it('文件库能持久化并重开读取', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mem-store-'))
+    try {
+      const dbPath = join(dir, 'nested', 'memory.sqlite')
+      const store = new MemoryStore({ path: dbPath })
+      store.insertEvent(ev({ seq: 1, text: '持久化内容' }), false)
+      store.close()
+
+      const reopened = new MemoryStore({ path: dbPath })
+      expect(reopened.getEvent('session-a', 1)?.text).toBe('持久化内容')
+      reopened.close()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

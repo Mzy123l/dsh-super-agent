@@ -1,141 +1,147 @@
-// 把封存段应用到会话 surface：这是「再前面的只有总结」的执行点。
+// 把封存段应用到会话表面。
 //
-// 关键机制：`session.append(type, data, { surfaceOp })`。
-// 一条 `surfaceOp: { op:'replace', startSeq, endSeq }` 的事件会**遮蔽**该区间，
-// 模型之后只看到新事件的内容；旧事件仍留在日志里，可回放、可检索。
+// 这是「总结」真正生效的地方：把一段历史替换成一个带槽位的事件。
 //
-// 依据：`dsh-session/lib/types/surface.js:190` `isReplaceOp`
-//   —— replace 恰好 3 个键 `{op, startSeq, endSeq}`，两个 seq 必须是非负安全整数。
+// ===========================================================================
+// 两条硬性约束
+// ===========================================================================
 //
-// 我们不使用 dsh 官方的 compaction 包：这里的替换由本插件自己发起。
+// 1. **replace 必须完整列出被遮蔽的节点**
+//    实测报错：`surface replace: sourceEventSeqs must include every shadowed surface node`
+//    → 必须从会话真实 surface 读，不能凭区间猜。
+//
+// 2. **「请提炼」这条 user prompt 只出现一次，不回传**
+//    用户原话：「这个 user prompt 不回传，只出现一次，不要上下文中全是这一条信息」
+//    → 触发提炼的那条提示，在提炼完成后必须被遮蔽掉，不能留在历史里。
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { SealedSegment } from './types.js'
-import { buildSealEvent } from './types.js'
+import type { Segment } from './types.js'
+import { composeSlottedText } from './types.js'
 
-/** 从会话对象里能拿到的能力（收窄，避免依赖 dsh 类型）。 */
+/** 会话里用得到的部分能力（收窄，不依赖 dsh 类型）。 */
 interface SessionLike {
   id?: string
   append?: (type: string, data: unknown, opts?: unknown) => unknown
-  snapshotEvents?: () => Array<{ seq: number; surfaceOp?: unknown }>
-  ownEvents?: () => Array<{ seq: number; surfaceOp?: unknown }>
-  events?: Array<{ seq: number; surfaceOp?: unknown }>
+  snapshotEvents?: () => Array<{ seq: number; type?: string; surfaceOp?: unknown }>
+  ownEvents?: () => Array<{ seq: number; type?: string; surfaceOp?: unknown }>
+  events?: Array<{ seq: number; type?: string; surfaceOp?: unknown }>
 }
 
-/** session 服务的最小形状。 */
+/** sessions 服务的最小形状。 */
 interface SessionsLike {
   get?: (id: string) => SessionLike | undefined
 }
 
 /**
- * 取会话的 append 能力。
+ * 取出某 seq 区间内、当前仍可见的 surface 节点 seq。
  *
- * dsh 的 `ctx.sessions.get(id)` 返回 Session 实例，其 `append` 是公开方法
- * （`dsh-session/README.zh.md`：`session.append(type, data, opts?)` 提交一个类型化事件）。
+ * dsh 要求 `sourceEventSeqs` 完整列出被遮蔽的每个节点，所以必须读真实 surface。
  *
- * @returns 成功时返回一个只做 append 的闭包；拿不到会话时返回 undefined。
- */
-export function resolveAppender(
-  ctx: Context,
-  sessionId: string,
-): ((type: string, data: unknown, opts?: unknown) => unknown) | undefined {
-  const sessions = (ctx as unknown as { sessions?: SessionsLike }).sessions
-  const session = sessions?.get?.(sessionId)
-  if (!session || typeof session.append !== 'function') return undefined
-  return session.append.bind(session)
-}
-
-/**
- * 把一段封存应用到会话。
- *
- * 语义：向会话追加一条 user 消息，内容是模型写的总结，并声明它**替换**了
- * `[fromSeq, toSeq]` 这段历史。
- *
- * 注意：这里不删除任何日志，只改变模型可见的 surface——这正是 dsh
- * 「Model-visible means logged」的要求：日志仍可完整回放。
- *
- * @param ctx - 插件上下文（用于取 sessions 服务）。
- * @param segment - 已落库的封存段。
- * @throws 当拿不到会话或 append 抛错时——调用方负责把总结保留在库里。
- */
-/**
- * 从会话里取出「某个 seq 区间内、当前仍然可见的 surface 节点 seq」。
- *
- * dsh 的 replace 要求 `sourceEventSeqs` **完整列出被遮蔽的每个节点**
- * （实测报错：`surface replace: sourceEventSeqs must include every shadowed surface node`）。
- * 所以不能凭 `[fromSeq, toSeq]` 猜，必须从会话的真实 surface 里读。
- *
- * 优先用 `session.snapshotEvents()`；不可用时退回 `session.ownEvents()` 再过滤。
- *
- * @returns 升序的 seq 列表；拿不到时返回 undefined。
+ * @returns 升序去重的 seq 列表；区间内没有可见节点时返回 undefined。
  */
 export function collectShadowedSeqs(
   session: SessionLike,
   fromSeq: number,
   toSeq: number,
 ): number[] | undefined {
-  const s = session as unknown as {
-    snapshotEvents?: () => Array<{ seq: number; surfaceOp?: unknown }>
-    ownEvents?: () => Array<{ seq: number; surfaceOp?: unknown }>
-    events?: Array<{ seq: number; surfaceOp?: unknown }>
-  }
-
   let all: Array<{ seq: number; surfaceOp?: unknown }> | undefined
-  if (typeof s.snapshotEvents === 'function') all = s.snapshotEvents()
-  else if (typeof s.ownEvents === 'function') all = s.ownEvents()
-  else if (Array.isArray(s.events)) all = s.events
+  if (typeof session.snapshotEvents === 'function') all = session.snapshotEvents()
+  else if (typeof session.ownEvents === 'function') all = session.ownEvents()
+  else if (Array.isArray(session.events)) all = session.events
   if (!Array.isArray(all)) return undefined
 
-  // 只取「进入过 surface 的事件」（带 surfaceOp），且落在区间内、不在替换事件之后。
   const seqs = all
     .filter(e => typeof e?.seq === 'number' && e.seq >= fromSeq && e.seq <= toSeq && e.surfaceOp !== undefined)
     .map(e => e.seq)
-  return seqs.length > 0 ? [...new Set(seqs)].sort((a, b) => a - b) : undefined
+
+  const unique = [...new Set(seqs)].sort((a, b) => a - b)
+  return unique.length > 0 ? unique : undefined
+}
+
+/** 构造用于替换的那个事件（带槽位）。 */
+function buildSegmentEvent(segment: Segment) {
+  const slots = [
+    // recent 为空（archived 阶段）时不输出该槽
+    { kind: 'recent' as const, text: segment.recent },
+    { kind: 'summary' as const, text: segment.summary },
+  ]
+  const text = composeSlottedText(slots)
+  return {
+    type: 'user/message' as const,
+    data: {
+      role: 'user' as const,
+      content: [{ type: 'text' as const, text }],
+      // 自定义 source.kind：让采集插件与模型都能识别这是记忆合并体
+      source: { kind: 'memory-slot' },
+    },
+  }
 }
 
 /**
  * 把一段封存应用到会话。
  *
- * 语义：向会话追加一条 user 消息，内容是模型写的总结，并声明它**替换**了
- * `[fromSeq, toSeq]` 这段历史。
- *
- * 注意：这里不删除任何日志，只改变模型可见的 surface——这正是 dsh
- * 「Model-visible means logged」的要求：日志仍可完整回放。
- *
- * @param ctx - 插件上下文（用于取 sessions 服务）。
- * @param segment - 已落库的封存段。
- * @throws 当拿不到会话、拿不到被遮蔽节点、或 append 抛错时——
- *         调用方负责把总结保留在库里（总结是唯一不可再生的东西）。
+ * @param ctx - 插件上下文（取 sessions 服务）。
+ * @param segment - 段内容。若是 archived 阶段，则只带 summary 槽。
+ * @throws 拿不到会话、区间内无可见节点、或 append 抛错时。
+ *         抛错时段的记录仍留在库里，可在下一轮重试。
  */
-export function applySeal(ctx: Context, segment: SealedSegment): void {
+export function applySegment(ctx: Context, segment: Segment): void {
   const sessions = (ctx as unknown as { sessions?: SessionsLike }).sessions
   const session = sessions?.get?.(segment.sessionId)
   if (!session || typeof session.append !== 'function') {
     throw new Error(`session ${segment.sessionId} is not reachable for sealing`)
   }
 
-  // dsh 要求精确列出被遮蔽的节点：不能猜，必须读真实 surface。
   const shadowed = collectShadowedSeqs(session, segment.fromSeq, segment.toSeq)
   if (!shadowed || shadowed.length === 0) {
     throw new Error(
-      `no surface nodes found in seq ${segment.fromSeq}–${segment.toSeq} of session ${segment.sessionId}; `
+      `no surface nodes in seq ${segment.fromSeq}–${segment.toSeq} of session ${segment.sessionId}; `
       + 'nothing would be shadowed, so the seal is refused',
     )
   }
 
-  const text = formatSealSummary(segment)
-  const [type, data, opts] = buildSealEvent(text, segment.fromSeq, segment.toSeq, shadowed)
-  session.append(type, data, opts)
+  const { type, data } = buildSegmentEvent(segment)
+  session.append(type, data, {
+    surfaceOp: { op: 'replace', startSeq: segment.fromSeq, endSeq: segment.toSeq },
+    sourceEventSeqs: shadowed,
+  })
 }
 
 /**
- * 构造封存总结的展示文本。
+ * 遮蔽一条「已经用过的提示」。
  *
- * 加一段机器可读的头部，让模型知道「这是一段已被封存的历史」，
- * 而不是用户刚刚说的话。这也让采集插件能识别它。
+ * 用户要求：触发提炼的 user prompt 只出现一次，不回传。
+ * 做法：在提炼完成后，用一条空内容的 replace 事件把那条提示的 seq 遮蔽掉。
+ *
+ * @param ctx - 插件上下文。
+ * @param sessionId - 会话 id。
+ * @param promptSeq - 那条提示的 seq。
+ * @throws 当会话不可达或该 seq 无可见节点时。
  */
-export function formatSealSummary(segment: Pick<SealedSegment, 'summary' | 'reason' | 'fromSeq' | 'toSeq' | 'turn'>): string {
-  const head = `[sealed segment · turns up to ${segment.turn} · seq ${segment.fromSeq}–${segment.toSeq}]`
-  const why = segment.reason ? `\nsealed because: ${segment.reason}` : ''
-  return `${head}${why}\n\n${segment.summary}`
+export function hidePromptAfterUse(ctx: Context, sessionId: string, promptSeq: number): void {
+  const sessions = (ctx as unknown as { sessions?: SessionsLike }).sessions
+  const session = sessions?.get?.(sessionId)
+  if (!session || typeof session.append !== 'function') {
+    throw new Error(`session ${sessionId} is not reachable to hide prompt`)
+  }
+
+  const visible = collectShadowedSeqs(session, promptSeq, promptSeq)
+  if (!visible) {
+    // 已经被遮蔽过——不重复处理，静默返回。
+    return
+  }
+
+  // 用一条极简占位替换，模型不会再看到长篇提示。
+  session.append(
+    'user/message',
+    {
+      role: 'user',
+      content: [{ type: 'text', text: '（已完成的提炼指令，不再显示）' }],
+      source: { kind: 'memory-prompt-hidden' },
+    },
+    {
+      surfaceOp: { op: 'replace', startSeq: promptSeq, endSeq: promptSeq },
+      sourceEventSeqs: visible,
+    },
+  )
 }

@@ -1,48 +1,81 @@
 // 全部公共类型定义
 
-/** 可索引记录的种类 */
-export type RecordKind =
+/**
+ * 事件载体种类。
+ *
+ * 每一种载体都是「一个事件」，各自占用一个全局唯一的 `eventNo`。
+ * 注意：一条 assistant 消息会产生**两个**事件——正文一个、思考一个。
+ */
+export type EventKind =
   | 'user'
   | 'assistant'
+  | 'reasoning'
   | 'tool-call'
   | 'tool-result'
   | 'summary'
 
-/** 一次工具调用或一条消息的可索引记录 */
-export interface MemoryRecord {
-  /** 原日志中的事件 seq */
+/** 兼容旧名（检索侧仍按 kind 分类） */
+export type RecordKind = EventKind
+
+/**
+ * 一个事件的完整描述（对应 event 表的一行）。
+ *
+ * **编号规则**：`eventNo` 是**会话内**的编号，从 1 开始独立递增。
+ * 会话 A 的 #1 与会话 B 的 #1 是不同事件；
+ * 唯一定位一个事件需要 (sessionId, eventNo) 这一对。
+ *
+ * `seq` 是 dsh 日志里的事件序号，只作为普通列保留。
+ */
+export interface EventRecord {
+  /** 会话内编号（写入后由数据库分配） */
+  eventNo?: number
+  /** dsh 会话内的事件序号 */
   seq: number
-  /** 会话 id（从目录名提取） */
   sessionId: string
-  kind: RecordKind
+  kind: EventKind
   /** ISO 时间 */
   at: string
-  /** 可检索正文（按规格 §3 规则提取） */
+  /** 可检索正文（reasoning 事件也用它，但不进 FTS） */
   text: string
-  /** 所在轮次（事件带 turn 时归属） */
+  /** 所在轮次 */
   turn?: number
 }
 
-/** 用户决策①：reasoning 不进 FTS，只向量化 */
-export interface ReasoningRecord {
-  seq: number
-  sessionId: string
-  at: string
-  turn?: number
-  /** 思考原文（只进向量库，绝不进 FTS） */
-  text: string
-  /** 若有 self-gist / turn-summary 可关联（理论预留） */
-  summary?: string
-}
+/** 兼容别名：检索侧沿用 MemoryRecord 这个名字 */
+export type MemoryRecord = EventRecord
 
-/** 带检索元数据的一条结果（records 或 reasoning） */
-export interface MemoryRecordResult extends MemoryRecord {
-  /** 该记录的原始事件当前是否已被压缩遮蔽 */
+/** 兼容别名：思考事件与普通事件同构，只是不进 FTS */
+export type ReasoningRecord = EventRecord
+
+/** 带检索元数据的一条结果 */
+export interface EventSearchResult extends EventRecord {
+  /** 数据库内部行号（仅供 FTS 关联，不对外做语义） */
+  rowId: number
+  /** 会话内编号（必填，来自数据库） */
+  eventNo: number
+  /** 该事件当前是否已被压缩遮蔽 */
   shadowed: boolean
   /** FTS rank 分数（关键词路径） */
   rank?: number
   /** RRF 合并分数（混合路径） */
   score?: number
+}
+
+/** 兼容别名 */
+export type MemoryRecordResult = EventSearchResult
+
+/** 关键词命中的轻量结果（FTS 路径用） */
+export interface KeywordHit {
+  /** 数据库内部行号（FTS rowid） */
+  rowId: number
+  /** 会话内编号 */
+  eventNo: number
+  sessionId: string
+  seq: number
+  kind: EventKind
+  at: string
+  /** FTS rank 分数（越小越相关，SQLite 约定） */
+  rank: number
 }
 
 /** reasoning 命中的结果（kind 恒为 'reasoning'，供调用方区分"思考"与"事实"） */
@@ -110,16 +143,22 @@ export interface SessionWatermark {
   eventCount: number
 }
 
-/** 索引状态统计 */
+/** 索引状态统计（status 命令用） */
 export interface IndexStatus {
+  /** 已索引的会话数 */
   sessions: number
-  records: number
+  /** 事件总数（每个事件都有独立编号） */
+  events: number
+  /** 其中：思考事件数 */
   reasoning: number
-  vectors: number
+  /** 其中：压缩摘要事件数 */
   summaries: number
+  /** 其中：被压缩遮蔽的事件数 */
   shadowed: number
+  /** 已封存段数（seal） */
+  sealed: number
+  /** 最近一次索引时间（ISO），从未索引为 null */
   lastIndexedAt: string | null
-  watermarks: SessionWatermark[]
 }
 
 /** 搜索模式 */
