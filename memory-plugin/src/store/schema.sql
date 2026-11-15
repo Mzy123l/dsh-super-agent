@@ -145,7 +145,9 @@ CREATE TABLE IF NOT EXISTS pending_summary (
   sessionId  TEXT PRIMARY KEY,
   unitIdx    INTEGER NOT NULL,
   promptText TEXT    NOT NULL,
-  createdAt  TEXT    NOT NULL
+  createdAt  TEXT    NOT NULL,
+  -- 上一次被内容校验拒收的回复（避免对同一条回复反复校验）
+  rejectedReply TEXT NOT NULL DEFAULT ''
 );
 
 -- 提炼回复指纹（一次性产物，不入库）

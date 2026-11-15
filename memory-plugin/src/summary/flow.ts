@@ -17,6 +17,7 @@ import type { MemoryStore } from '../store/sqlite.js'
 import type { Unit } from '../types.js'
 import type { PendingStore, PendingSummary } from './pending.js'
 import { buildSummaryPrompt, isNoSummary, summaryDecision, unitsNeedingSummary } from '../projection/render.js'
+import { validateSummary } from './validate.js'
 
 /** 长单位阈值（字符数）。 */
 export const SUMMARY_THRESHOLD = 4000
@@ -116,10 +117,14 @@ function pickNext(candidates: readonly Unit[], threshold: number): Unit {
 /**
  * 尝试收割模型回复作为 summary。
  *
- * 三个条件必须同时满足：
+ * 四个条件必须同时满足：
  *   1. 有 assistant 回复
  *   2. 回复晚于 pending 的创建时刻（否则收的是更早的历史）
  *   3. 回复非空
+ *   4. **回复内容确实是在提炼该单位**（内容校验，见 validate.ts）
+ *
+ * 校验失败时**保留 pending**（标记已尝试），下一轮再看——
+ * 因为模型可能这一轮先说了过程性的话，真正提炼在下一轮。
  *
  * @returns 收割动作；返回 undefined 表示「还没到时候」。
  */
@@ -133,16 +138,35 @@ function tryHarvest(sessionId: string, awaiting: PendingSummary, host: SummaryHo
   const trimmed = text.trim()
   if (trimmed.length === 0) return undefined
 
-  // 模型回「无」表示该单位不值得提炼（短单位可选的实现方式）
-  const skipped = isNoSummary(trimmed)
-  const summary = skipped ? '' : trimmed
+  // 已经处理过这条回复 → 等新的
+  if (awaiting.rejectedReply === trimmed) return undefined
 
+  // 模型回「无」表示该单位不值得提炼（短单位可选的实现方式）
+  if (isNoSummary(trimmed)) {
+    host.pending.rememberReply(sessionId, trimmed)
+    host.pending.clear(sessionId)
+    return { kind: 'harvested', unitIdx: awaiting.unitIdx, summary: '', skipped: true }
+  }
+
+  // 内容校验：这一条到底是不是在提炼该单位
+  const target = host.store.getUnit(sessionId, awaiting.unitIdx)
+  if (target) {
+    const check = validateSummary(trimmed, target.content)
+    if (!check.ok) {
+      // 拒收，但保留 pending：模型可能下一轮才真正提炼
+      host.pending.markRejected(sessionId, trimmed, check.reason)
+      host.warn(`summary: 拒收 #${awaiting.unitIdx} 的回复 —— ${check.reason}`)
+      return { kind: 'idle', reason: `rejected: ${check.reason}` }
+    }
+  }
+
+  const summary = trimmed
   try {
-    if (!skipped) host.store.setSummary(sessionId, awaiting.unitIdx, summary)
+    host.store.setSummary(sessionId, awaiting.unitIdx, summary)
     // 登记回复指纹：这条回复是一次性产物，不得作为普通 reply 单位入库
     host.pending.rememberReply(sessionId, trimmed)
     host.pending.clear(sessionId)
-    return { kind: 'harvested', unitIdx: awaiting.unitIdx, summary, skipped }
+    return { kind: 'harvested', unitIdx: awaiting.unitIdx, summary, skipped: false }
   } catch (error) {
     host.pending.clear(sessionId)
     host.warn(`summary: harvest failed: ${String(error)}`)

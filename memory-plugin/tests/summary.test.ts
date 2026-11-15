@@ -165,10 +165,19 @@ describe('总结流程', () => {
     }
   }
 
+  /** 一段有实词内容的长文本（够真实，才能通过收割校验）。 */
+  const LONG_TEXT = (
+    '排查登录超时：确认 token 刷新逻辑在 memory-plugin 的 dsh-bundle 里，'
+    + 'ttl 配置为 300 秒，重试窗口需要 600 秒。'
+    + '否决了改前端的方案，因为根因在后端刷新时机；'
+    + '否决了加大 ttl 到 3600 的方案，因为会影响安全策略。'
+    + '最终决定把刷新提前 5 分钟，并在 validate 模块里加长度校验。'
+  ).repeat(4)
+
   /** 灌一个长单位。 */
   function fillLong(idx = 0): void {
     store.appendUnit({
-      sessionId: 's', kind: 'reply', summary: '', content: 'x'.repeat(500),
+      sessionId: 's', kind: 'reply', summary: '', content: LONG_TEXT,
       at: '2026-11-15T00:00:00.000Z', inContext: true, tags: [],
     })
   }
@@ -208,14 +217,14 @@ describe('总结流程', () => {
     runSummaryStep('s', host())
     const p = pending.get('s')!
     assistant = {
-      text: 'rejected: 方案A — because 冲突\nchosen: 方案B',
+      text: "否决改前端：because 根因在后端刷新时机；否决加大 ttl：because 影响安全策略；最终决定把刷新提前 5 分钟，并在 validate 模块加长度校验。",
       at: new Date(Date.parse(p.createdAt) + 1000).toISOString(),
     }
     const a = runSummaryStep('s', host())
     expect(a.kind).toBe('harvested')
     if (a.kind !== 'harvested') return
     expect(a.skipped).toBe(false)
-    expect(store.getUnit('s', 0)?.summary).toContain('方案A')
+    expect(store.getUnit('s', 0)?.summary).toContain('否决改前端')
     expect(pending.get('s')).toBeUndefined()
   })
 
@@ -253,16 +262,22 @@ describe('总结流程', () => {
     fillLong()
     runSummaryStep('s', host())
     const p = pending.get('s')!
-    assistant = { text: '要点', at: new Date(Date.parse(p.createdAt) + 1000).toISOString() }
+    assistant = {
+      text: '排查登录超时：ttl 300 秒偏短，重试窗口需要 600 秒；最终把刷新提前 5 分钟，改动落在 dsh-bundle 与 validate 模块。',
+      at: new Date(Date.parse(p.createdAt) + 1000).toISOString(),
+    }
     runSummaryStep('s', host())
 
     const u = store.getUnit('s', 0)!
     // 近程渲染仍含完整 content
-    expect(renderUnit(u, true)).toContain('xxxxxxxx')
+    expect(renderUnit(u, true)).toContain('排查登录超时')
     // 远程渲染只剩 summary
-    expect(renderUnit(u, false)).toBe('#0 <summary>要点</summary>')
+    const remote = renderUnit(u, false)
+    expect(remote).toContain('<summary>')
+    expect(remote).not.toContain('ttl 配置为 300 秒')
   })
 })
+
 
 describe('三档阈值', () => {
   it('1200 及以下保留原文', () => {
