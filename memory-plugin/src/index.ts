@@ -34,3 +34,12 @@ export { search, searchReasoning, type SearchContext } from './search/index.js'
 
 // API
 export { startApiServer, type ApiServerOptions } from './api/server.js'
+
+// dsh bundle 适配层（仅在 dsh 环境里可用；独立使用 CLI 时不需要）
+export {
+  name,
+  inject,
+  apply,
+  dispose,
+  type Config,
+} from './dsh-bundle.js'

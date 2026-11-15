@@ -1,0 +1,7 @@
+# 记忆插件的 dsh bundle 层：插入插件本身（不含预设）。
+#
+# 插件提供 `memory_search` 工具与索引服务；配置（会话日志目录、数据目录）
+# 由 profile 的环境变量或插件配置给出，插件有合理缺省。
+- insert:
+    - id: memory-plugin
+      name: 'dsh-memory-plugin'

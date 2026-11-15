@@ -1,22 +1,50 @@
 {
-  "name": "memory-plugin",
-  "version": "0.1.0",
+  "name": "dsh-memory-plugin",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "DSH 会话记忆插件（纯理论实现）：全量索引会话日志，提供关键词 + 向量双路检索",
+  "description": "DSH 会话记忆插件：全量索引会话日志，提供关键词 + 向量双路检索；可作为 dsh bundle 挂载",
   "bin": {
     "memory-plugin": "./dist/cli.js"
   },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/postbuild.mjs",
     "test": "vitest run --coverage",
     "cli": "node dist/cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "dependencies": {
     "better-sqlite3": "^12.2.0"
   },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.5",
+    "@deepseek-ai/dsh-tools": "^0.2.1-rc.5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/dsh-tools": { "optional": true }
+  },
   "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.5",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.15.0",
     "@vitest/coverage-v8": "^3.1.0",
