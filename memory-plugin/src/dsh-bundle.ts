@@ -24,7 +24,12 @@ export const name = 'memory-plugin'
 /** 依赖的服务。 */
 export const inject = ['tools']
 
-/** 插件配置。 */
+/**
+ * 插件配置。
+ *
+ * 注意：cordis 的 `ctx.config` 需要在 `inject` 里声明 `'config'` 才能访问，
+ * 而声明后插件会等待配置服务就绪——为避免这种耦合，配置一律走环境变量。
+ */
 export interface Config {
   /** DSH 的会话日志根目录（通常 $DSH_HOME/sessions）。 */
   sessionsDir: string
@@ -36,14 +41,14 @@ export interface Config {
 
 const DEFAULT_MAX_RESULTS = 8
 
-/** 读取配置，缺省走环境变量，便于 CLI 与面板共用。 */
-function resolveConfig(ctx: Context): Config {
-  const raw = ((ctx as unknown as { config?: Partial<Config> }).config ?? {}) as Partial<Config>
+/** 从环境变量读配置（不触碰 ctx.config，避免 inject 依赖）。 */
+function resolveConfig(): Config {
   const home = process.env.DSH_HOME ?? `${process.env.HOME ?? '.'}/.dsh`
+  const max = Number(process.env.MEMORY_MAX_RESULTS ?? DEFAULT_MAX_RESULTS)
   return {
-    sessionsDir: raw.sessionsDir ?? process.env.MEMORY_SESSIONS_DIR ?? `${home}/sessions`,
-    dataDir: raw.dataDir ?? process.env.MEMORY_DATA_DIR ?? './data',
-    maxResults: raw.maxResults ?? DEFAULT_MAX_RESULTS,
+    sessionsDir: process.env.MEMORY_SESSIONS_DIR ?? `${home}/sessions`,
+    dataDir: process.env.MEMORY_DATA_DIR ?? './data',
+    maxResults: Number.isFinite(max) && max > 0 ? max : DEFAULT_MAX_RESULTS,
   }
 }
 
@@ -55,7 +60,7 @@ function resolveConfig(ctx: Context): Config {
  * 模型不会因为索引更新而多看到任何东西。
  */
 export function apply(ctx: Context): void {
-  const config = resolveConfig(ctx)
+  const config = resolveConfig()
   const store = new MemoryStore({ path: `${config.dataDir}/memory.sqlite` })
   const vectorStore = new NoopVectorStore()
   const indexerConfig: IndexerConfig = {
@@ -162,7 +167,9 @@ export function apply(ctx: Context): void {
   })
 
   // 提供手动索引入口（面板/CLI 复用）。
-  ;(ctx as unknown as { memory?: unknown }).memory = {
+  // 必须用 ctx.provide：cordis 的 ctx 是代理，直接赋值未声明的属性会抛
+  // "cannot set property ... without provide"，导致整个插件激活失败。
+  ctx.provide('memory', {
     indexAll: () => indexAll(indexerConfig, store),
     indexSession: async (id: string) => {
       const files = discoverSessionFiles(config.sessionsDir).filter(f => f.sessionId === id)
@@ -171,7 +178,7 @@ export function apply(ctx: Context): void {
       }
     },
     store,
-  }
+  })
 }
 
 /** 释放资源：关闭数据库。 */

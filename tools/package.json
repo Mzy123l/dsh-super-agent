@@ -1,0 +1,19 @@
+{
+  "name": "gen-memory-debug",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "把两轮上下文采集 JSONL 渲染成自包含的左右对比 HTML（增量气泡）",
+  "bin": {
+    "gen-memory-debug": "./dist/gen-memory-debug.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "gen": "node dist/gen-memory-debug.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.0"
+  }
+}

@@ -1,0 +1,7 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 采集输出（实测数据，不入库）
+captures/
+*.jsonl

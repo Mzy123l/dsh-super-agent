@@ -1,0 +1,16 @@
+# memory-debug-capture 的 dsh bundle 层：插入调试采集插件本身。
+#
+# 插件挂 `llm/stream` waterfall，把每次模型请求的完整上下文（options.messages）
+# 落盘为 JSONL。它**不注入任何上下文、不改变模型行为**，只旁路观测。
+#
+# 配置来自环境变量（见 README）：
+# - MEMORY_DEBUG_OUT         输出目录（默认 ./captures/）
+# - MEMORY_DEBUG_VARIANT     A/B 变体标记：on / off
+# - MEMORY_DEBUG_RUN_ID      本轮 run 的标识
+# - MEMORY_DEBUG_MAX_CHARS   单条消息文本的截断上限（默认不截断）
+#
+# 插件行不声明 inject：它只读 ctx 上已经存在的事件与服务，
+# 这样它可以在 llm 服务挂载之前就先起来，也不会因为服务缺失而反复重载。
+- insert:
+    - id: memory-debug-capture
+      name: 'dsh-memory-debug-capture'

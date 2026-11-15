@@ -1,0 +1,842 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<link rel="icon" href="data:,">
+<title>示例：记忆插件启用/禁用的上下文对比（夹具数据）</title>
+<style>
+:root{
+  color-scheme: dark;
+  --bg:#0b0f15;
+  --bg-2:#0e141d;
+  --panel:#121a24;
+  --panel-2:#16202b;
+  --panel-3:#1b2632;
+  --code-bg:#080c11;
+  --line:#1f2a38;
+  --line-soft:#18212c;
+  --line-strong:#2c3c50;
+  --txt:#dfe7f1;
+  --txt-2:#bcc9d8;
+  --dim:#9aa8ba;
+  --faint:#7f8da0;
+  --blue:#6ea8fe;
+  --green:#4ac26b;
+  --green-bg:rgba(74,194,107,.10);
+  --green-line:rgba(74,194,107,.45);
+  --red:#f0797c;
+  --red-bg:rgba(240,121,124,.08);
+  --red-line:rgba(240,121,124,.45);
+  --amber:#e2b441;
+  --amber-bg:rgba(226,180,65,.10);
+  --amber-line:rgba(226,180,65,.45);
+  --gray:#7c8a9c;
+  --gray-bg:rgba(124,138,156,.07);
+  --gray-line:rgba(124,138,156,.30);
+  --strong:#ffffff;
+  --mono:"Cascadia Code",Consolas,"SF Mono",ui-monospace,monospace;
+  --sans:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;
+  --radius:10px;
+  --head-h:132px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:
+    radial-gradient(1100px 560px at 12% -12%, rgba(110,168,254,.07), transparent 62%),
+    radial-gradient(900px 480px at 96% -4%, rgba(74,194,107,.05), transparent 60%),
+    var(--bg);
+  color:var(--txt);
+  font-family:var(--sans);
+  font-size:14.5px;
+  line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+}
+code,.mono{font-family:var(--mono)}
+b,strong{color:var(--strong);font-weight:600}
+
+/* ── 顶部标题区 ─────────────────────────────── */
+.page-head{padding:26px 32px 16px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,var(--bg-2),transparent)}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint);margin-bottom:8px}
+.page-head h1{margin:0 0 8px;font-size:25px;line-height:1.3;letter-spacing:-.01em;font-weight:650}
+.page-head .lede{margin:0;color:var(--txt-2);max-width:88ch;font-size:13.5px}
+.meta-grid{
+  display:flex;flex-wrap:wrap;gap:6px 26px;margin-top:12px;
+  font-family:var(--mono);font-size:12px;color:var(--faint);
+}
+.meta-grid b{color:var(--txt-2);font-weight:500}
+
+/* ── 工具条 ─────────────────────────────────── */
+.toolbar{
+  position:sticky;top:0;z-index:40;
+  display:flex;align-items:center;gap:16px;flex-wrap:wrap;
+  padding:9px 32px;
+  background:rgba(11,15,21,.95);
+  backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--line);
+}
+.switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer;user-select:none;font-size:13px;color:var(--txt-2)}
+.switch input{position:absolute;opacity:0;width:1px;height:1px}
+.switch .track{position:relative;width:34px;height:18px;border-radius:999px;background:var(--panel-3);border:1px solid var(--line-strong);transition:.16s ease;flex:none}
+.switch .track::after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:var(--dim);transition:.16s ease}
+.switch input:checked + .track{background:var(--green-bg);border-color:var(--green-line)}
+.switch input:checked + .track::after{left:17px;background:var(--green)}
+.switch input:focus-visible + .track{outline:2px solid var(--blue);outline-offset:2px}
+.toolbar .btn{
+  font-family:var(--sans);font-size:12.5px;color:var(--txt-2);background:var(--panel);
+  border:1px solid var(--line-strong);border-radius:7px;padding:4px 11px;cursor:pointer;transition:.14s;
+}
+.toolbar .btn:hover{color:var(--txt);border-color:var(--blue)}
+.toolbar .hint{font-size:12px;color:var(--faint);margin-left:auto}
+.seg{display:inline-flex;border:1px solid var(--line-strong);border-radius:7px;overflow:hidden}
+.seg button{
+  font-family:var(--sans);font-size:12.5px;background:transparent;color:var(--txt-2);
+  border:0;padding:5px 13px;cursor:pointer;transition:.14s;
+}
+.seg button+button{border-left:1px solid var(--line-strong)}
+.seg button.on{background:var(--green-bg);color:var(--green)}
+
+/* ── 概览卡片 ───────────────────────────────── */
+.overview{padding:18px 32px 4px}
+.ov-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(178px,1fr));gap:10px}
+.ov-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:11px 14px;min-width:0}
+.ov-card h3{margin:0 0 6px;font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--faint);font-weight:600}
+.ov-card .big{font-family:var(--mono);font-size:20px;line-height:1.2;color:var(--strong)}
+.ov-card .sub{margin-top:4px;font-size:11.5px;color:var(--faint);font-family:var(--mono)}
+.ov-card--good{border-color:var(--green-line);background:linear-gradient(180deg,var(--green-bg),transparent 72%)}
+.ov-card--good .big{color:var(--green)}
+.ov-card--warn{border-color:var(--amber-line);background:linear-gradient(180deg,var(--amber-bg),transparent 72%)}
+.ov-card--warn .big{color:var(--amber)}
+
+/* ── 会话选择 ───────────────────────────────── */
+.sessions{padding:12px 32px 0}
+.session-tabs{display:flex;gap:7px;flex-wrap:wrap}
+.session-tabs button{
+  font-family:var(--mono);font-size:12px;background:var(--panel);color:var(--txt-2);
+  border:1px solid var(--line);border-radius:7px;padding:4px 11px;cursor:pointer;
+}
+.session-tabs button.on{border-color:var(--blue);color:var(--blue);background:rgba(110,168,254,.08)}
+
+/* ── 双栏 ───────────────────────────────────── */
+.compare{padding:16px 32px 26px}
+.col-head{
+  display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:12px;
+}
+.col-title{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:10px 14px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;
+}
+.col-title h2{margin:0;font-size:14.5px;font-weight:650}
+.col-title .tag{
+  font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:999px;
+  border:1px solid var(--line-strong);color:var(--dim);
+}
+.col-title--on .tag{border-color:var(--green-line);color:var(--green);background:var(--green-bg)}
+.col-title--off .tag{border-color:var(--line-strong);color:var(--dim)}
+.col-title .meta{font-family:var(--mono);font-size:11.5px;color:var(--faint);margin-left:auto}
+
+/* 逐行布局：每一行 = 同一步的左右两个气泡，顶部严格对齐 */
+.rows{display:flex;flex-direction:column;gap:12px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+.cell{min-width:0;position:relative;padding-left:22px}
+.cell::before{
+  content:"";position:absolute;left:8px;top:6px;bottom:6px;width:2px;
+  background:linear-gradient(180deg,var(--line-strong),var(--line));border-radius:2px;
+}
+.cell--on::before{background:linear-gradient(180deg,var(--green-line),var(--line))}
+
+/* ── 统计条（sticky） ───────────────────────── */
+.statbar-row{
+  position:sticky;top:41px;z-index:30;
+  display:grid;grid-template-columns:1fr 1fr;gap:16px;
+  margin-bottom:14px;pointer-events:none;
+}
+.statbar{
+  background:rgba(18,26,36,.96);
+  backdrop-filter:blur(6px);
+  border:1px solid var(--line);border-radius:var(--radius);
+  padding:7px 12px;
+  display:flex;flex-wrap:wrap;gap:5px 15px;
+  font-family:var(--mono);font-size:11.5px;color:var(--dim);
+}
+.statbar b{color:var(--txt-2);font-weight:500}
+.statbar .v{color:var(--strong)}
+.statbar .sep{color:var(--line-strong)}
+.statbar .warn{color:var(--amber)}
+
+/* ── 气泡 ───────────────────────────────────── */
+.bubble{
+  position:relative;margin:0;
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:10px 13px 11px;
+}
+.bubble::before{
+  content:"";position:absolute;left:-19px;top:16px;width:11px;height:11px;border-radius:50%;
+  background:var(--bg);border:2px solid var(--gray-line);
+}
+.bubble::after{
+  content:"";position:absolute;left:-13px;top:20px;width:6px;height:2px;background:var(--line-strong);
+}
+.bubble[data-accent="1"]::before{border-color:var(--green-line);background:var(--green)}
+.bubble[data-accent="2"]::before{border-color:var(--red-line);background:var(--red)}
+.bubble[data-accent="3"]::before{border-color:var(--amber-line);background:var(--amber)}
+.bubble[data-accent="4"]::before{border-color:var(--amber-line);background:var(--amber)}
+.bubble--diff{box-shadow:0 0 0 1px var(--amber-line)}
+.bubble.hidden{display:none}
+.row.hidden{display:none}
+.row--current .cell::before{background:linear-gradient(180deg,var(--blue),var(--line-strong))}
+.row--current .bubble{border-color:var(--line-strong)}
+
+.bubble-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:7px}
+.bubble-head .idx{
+  font-family:var(--mono);font-size:11px;color:var(--faint);
+  background:var(--panel-2);border:1px solid var(--line);border-radius:999px;padding:1px 9px;
+}
+.bubble-head .lbl{font-size:13px;font-weight:600;color:var(--txt)}
+.bubble-head .step{font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+.bubble-head .totals{margin-left:auto;display:flex;gap:11px;flex-wrap:wrap;font-family:var(--mono);font-size:11.5px;color:var(--dim)}
+.bubble-head .totals b{color:var(--txt-2);font-weight:500}
+
+.chips{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:7px}
+.chip{
+  font-family:var(--mono);font-size:10.5px;border-radius:5px;padding:1px 7px;
+  border:1px solid var(--line-strong);color:var(--dim);background:var(--panel-2);
+  cursor:default;
+}
+.chip--add{border-color:var(--green-line);color:var(--green);background:var(--green-bg)}
+.chip--del{border-color:var(--red-line);color:var(--red);background:var(--red-bg)}
+.chip--chg{border-color:var(--amber-line);color:var(--amber);background:var(--amber-bg)}
+.chip--same{border-color:var(--gray-line);color:var(--gray);background:var(--gray-bg)}
+.chip--lcpmatch{border-color:var(--amber-line);color:var(--amber);background:var(--amber-bg);font-weight:600}
+
+.unchanged{
+  font-family:var(--mono);font-size:11.5px;color:var(--faint);
+  background:var(--gray-bg);border:1px dashed var(--gray-line);border-radius:7px;
+  padding:5px 10px;margin-bottom:7px;
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+}
+.unchanged .expand{cursor:pointer;color:var(--dim);text-decoration:underline dotted}
+.unchanged .expand:hover{color:var(--blue)}
+.unchanged .detail{display:none;margin-top:6px;border-left:2px solid var(--gray-line);padding-left:10px}
+.unchanged.open .detail{display:block}
+
+.ops{display:flex;flex-direction:column;gap:5px}
+.op{
+  display:grid;grid-template-columns:56px 74px 1fr auto;gap:9px;align-items:start;
+  border:1px solid var(--line);border-radius:8px;padding:6px 9px;
+  background:var(--panel-2);font-size:12.5px;
+}
+.op[data-kind="1"]{border-color:var(--green-line);background:linear-gradient(90deg,var(--green-bg),transparent 46%)}
+.op[data-kind="2"]{border-color:var(--red-line);background:linear-gradient(90deg,var(--red-bg),transparent 46%)}
+.op[data-kind="3"],.op[data-kind="4"]{border-color:var(--amber-line);background:linear-gradient(90deg,var(--amber-bg),transparent 46%)}
+.op .k{
+  font-family:var(--mono);font-size:10.5px;text-align:center;border-radius:5px;padding:1px 0;
+  border:1px solid var(--line-strong);color:var(--dim);
+}
+.op[data-kind="1"] .k{border-color:var(--green-line);color:var(--green);background:var(--green-bg)}
+.op[data-kind="2"] .k{border-color:var(--red-line);color:var(--red);background:var(--red-bg)}
+.op[data-kind="3"] .k,.op[data-kind="4"] .k{border-color:var(--amber-line);color:var(--amber);background:var(--amber-bg)}
+.op .role{font-family:var(--mono);font-size:11px;color:var(--txt-2)}
+.op .body{min-width:0}
+.op .body .txt{
+  font-family:var(--mono);font-size:11.8px;line-height:1.55;color:var(--txt-2);
+  white-space:pre-wrap;word-break:break-word;
+  max-height:3.6em;overflow:hidden;position:relative;
+}
+.op .body .txt.full{max-height:none}
+.op .body .txt:not(.full)::after{
+  content:"";position:absolute;left:0;right:0;bottom:0;height:1.4em;
+  background:linear-gradient(180deg,transparent,var(--panel-2));
+}
+.op[data-kind="1"] .body .txt:not(.full)::after{background:linear-gradient(180deg,transparent,#16202b)}
+.op .body .more{
+  font-family:var(--mono);font-size:11px;color:var(--blue);cursor:pointer;margin-top:3px;
+  text-decoration:underline dotted;
+}
+.op .body .more:hover{color:var(--green)}
+.op .size{font-family:var(--mono);font-size:11px;color:var(--faint);white-space:nowrap;padding-top:1px}
+.op .reasoning{margin-top:5px;border-left:2px solid var(--amber-line);padding-left:8px}
+.op .reasoning .lbl{font-family:var(--mono);font-size:10.5px;color:var(--amber);display:block;margin-bottom:2px}
+.op .old{margin-top:5px;border-left:2px solid var(--red-line);padding-left:8px}
+.op .old .lbl{font-family:var(--mono);font-size:10.5px;color:var(--red);display:block;margin-bottom:2px}
+.hidden-note{font-family:var(--mono);font-size:11px;color:var(--faint);padding:3px 2px}
+
+.empty{
+  border:1px dashed var(--line-strong);border-radius:var(--radius);
+  padding:22px;text-align:center;color:var(--faint);font-size:13px;
+}
+
+/* ── 底部汇总表 ─────────────────────────────── */
+.summary{padding:6px 32px 40px}
+.summary h2{font-size:16px;margin:0 0 10px;font-weight:650;display:flex;align-items:center;gap:9px}
+.summary h2 .bar{width:3px;height:16px;border-radius:2px;background:var(--blue);flex:none}
+.summary h2 .t-sub{font-weight:400;font-size:12.5px;color:var(--faint);font-family:var(--mono)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{border-bottom:1px solid var(--line);padding:6px 10px;text-align:right;white-space:nowrap}
+th{
+  color:var(--faint);font-weight:600;font-size:11px;letter-spacing:.06em;text-transform:uppercase;
+  text-align:right;position:sticky;top:41px;background:var(--bg);z-index:20;
+}
+th:first-child,td:first-child{text-align:left}
+tbody tr:hover{background:rgba(110,168,254,.05)}
+tbody tr.diff td:first-child{box-shadow:inset 3px 0 0 var(--amber)}
+td .mono{font-family:var(--mono);color:var(--txt-2)}
+td .up{color:var(--red)}
+td .down{color:var(--green)}
+td .flat{color:var(--faint)}
+tr.lcp-diff td{background:rgba(226,180,65,.07)}
+.notes{font-size:11.5px;color:var(--amber);text-align:left}
+.totals-row td{font-weight:600;color:var(--strong);border-top:1px solid var(--line-strong);background:var(--panel)}
+
+.warn-box{
+  margin:14px 32px 0;border:1px solid var(--amber-line);background:var(--amber-bg);
+  border-radius:var(--radius);padding:10px 14px;font-size:12.5px;color:var(--txt-2);
+}
+.warn-box h3{margin:0 0 5px;font-size:12.5px;color:var(--amber);font-weight:600}
+.warn-box ul{margin:0;padding-left:19px}
+
+@media (max-width:1080px){
+  .row{grid-template-columns:1fr}
+  .col-head{grid-template-columns:1fr}
+  .statbar-row{grid-template-columns:1fr}
+  .op{grid-template-columns:52px 66px 1fr;}
+  .op .size{grid-column:3;text-align:left}
+  .cell--on{padding-top:2px}
+}
+</style>
+</head>
+<body>
+<header class="page-head">
+<div class="eyebrow">DSH MEMORY DEBUG · 上下文增量对比</div>
+<h1>示例：记忆插件启用/禁用的上下文对比（夹具数据）</h1>
+<p class="lede">左栏为<em>不启用插件</em>的一轮上下文采集，右栏为<em>启用插件</em>的一轮。每个气泡是一次请求送出的上下文；气泡里只列<em>相对上一次请求的新增部分</em>，未变的前缀折叠收起。
+<div class="meta-grid">
+<span>运行批次 <b>run-2026-11-15-on | run-2026-11-15-off</b></span>
+<span>模型 <b>deepseek-chat</b></span>
+<span>提供方 <b>deepseek</b></span>
+<span>总气泡数 <b>6</b></span>
+<span>生成时间 <b>2026-11-15T07:39:12.813Z</b></span>
+</div>
+</header>
+<div class="toolbar">
+<div class="seg" id="mode-seg"><button data-mode="diff" class="on">只看差异</button><button data-mode="all">全量</button></div>
+<label class="switch"><input type="checkbox" id="toggle-diff" checked><span class="track"></span><span class="txt">只看差异</span></label>
+<label class="switch"><input type="checkbox" id="toggle-link" checked><span class="track"></span><span class="txt">联动滚动</span></label>
+<span class="hint">点击气泡里的「展开」看完整正文；灰色块点开可看未变部分</span>
+</div>
+<section class="overview"><div class="ov-grid">
+<div class="ov-card "><h3>不启用插件 · 最终字符</h3><div class="big">61</div><div class="sub">消息 4 条</div></div>
+<div class="ov-card ov-card--good"><h3>启用插件 · 最终字符</h3><div class="big">73</div><div class="sub">消息 3 条</div></div>
+<div class="ov-card ov-card--warn"><h3>累计节省（字符）</h3><div class="big">多出 228</div><div class="sub">消息 多 2 条</div></div>
+<div class="ov-card ov-card--good"><h3>单步最大节省</h3><div class="big">0</div><div class="sub">对比步数 6</div></div>
+</div></section>
+<main class="compare">
+<section class="pair" data-key="session-demo-0001">
+<div class="col-head">
+<div class="col-title col-title--off"><h2>不启用插件</h2><span class="tag">variant=off</span><span class="meta">session-demo-0001 · run-2026-11-15-off · 5 次请求</span></div>
+<div class="col-title col-title--on"><h2>启用插件</h2><span class="tag">variant=on</span><span class="meta">session-demo-0001 · run-2026-11-15-on · 6 次请求</span></div>
+</div>
+<div class="statbar-row">
+<div class="statbar" id="stat-off"><span>气泡 <b data-f="ord">—</b></span><span class="sep">|</span><span>消息 <b class="v" data-f="msg">—</b></span><span>字符 <b class="v" data-f="chars">—</b></span><span>reasoning <b class="v" data-f="reason">—</b></span><span>system <b class="v" data-f="system">—</b></span><span>LCP <b data-f="lcp">—</b></span></div>
+<div class="statbar" id="stat-on"><span>气泡 <b data-f="ord">—</b></span><span class="sep">|</span><span>消息 <b class="v" data-f="msg">—</b></span><span>字符 <b class="v" data-f="chars">—</b></span><span>reasoning <b class="v" data-f="reason">—</b></span><span>system <b class="v" data-f="system">—</b></span><span>LCP <b data-f="lcp">—</b></span></div>
+</div>
+<div class="rows" id="rows-session-demo-0001">
+<div class="row">
+<div class="cell cell--off" data-step="0">
+<div class="bubble bubble--diff" data-accent="1" data-side="off" data-step-index="0" data-diff="1" data-stepdiff="1" data-ord="1" data-msg="2" data-chars="54" data-reason="0" data-system="15" data-lcp="0"><div class="bubble-head"><span class="idx">气泡 1</span><span class="lbl">第 1 轮 · step 1</span><span class="step">2026-11-15T06:00:10.000Z</span><span class="totals"><span>消息 <b>2</b></span><span>字符 <b>54</b></span><span>reasoning <b>0</b></span><span>system <b>15</b></span></span></div><div class="chips"><span class="chip chip--add">新增 2</span><span class="chip chip--chg">与对侧同一步有差异</span></div><div class="bubble-body" data-filled="0"></div></div>
+</div>
+<div class="cell cell--on" data-step="0">
+<div class="bubble bubble--diff" data-accent="1" data-side="on" data-step-index="0" data-diff="1" data-stepdiff="1" data-ord="1" data-msg="2" data-chars="86" data-reason="0" data-system="47" data-lcp="0"><div class="bubble-head"><span class="idx">气泡 1</span><span class="lbl">第 1 轮 · step 1</span><span class="step">2026-11-15T06:00:10.000Z</span><span class="totals"><span>消息 <b>2</b></span><span>字符 <b>86</b></span><span>reasoning <b>0</b></span><span>system <b>47</b></span></span></div><div class="chips"><span class="chip chip--add">新增 2</span><span class="chip chip--chg">与对侧同一步有差异</span></div><div class="bubble-body" data-filled="0"></div></div>
+</div>
+</div>
+<div class="row">
+<div class="cell cell--off" data-step="1">
+<div class="bubble bubble--diff" data-accent="1" data-side="off" data-step-index="1" data-diff="1" data-stepdiff="1" data-ord="2" data-msg="4" data-chars="79" data-reason="27" data-system="15" data-lcp="2"><div class="bubble-head"><span class="idx">气泡 2</span><span class="lbl">第 1 轮 · step 2</span><span class="step">2026-11-15T06:00:20.000Z</span><span class="totals"><span>消息 <b>4</b></span><span>字符 <b>79</b></span><span>reasoning <b>27</b></span><span>system <b>15</b></span></span></div><div class="chips"><span class="chip chip--same" title="与上一次请求完全一致的前缀">未变前缀 2</span><span class="chip chip--add">新增 2</span><span class="chip chip--chg">与对侧同一步有差异</span></div><div class="bubble-body" data-filled="0"></div></div>
+</div>
+<div class="cell cell--on" data-step="1">
+<div class="bubble bubble--diff" data-accent="1" data-side="on" data-step-index="1" data-diff="1" data-stepdiff="1" data-ord="2" data-msg="4" data-chars="111" data-reason="0" data-system="47" data-lcp="2"><div class="bubble-head"><span class="idx">气泡 2</span><span class="lbl">第 1 轮 · step 2</span><span class="step">2026-11-15T06:00:20.000Z</span><span class="totals"><span>消息 <b>4</b></span><span>字符 <b>111</b></span><span>reasoning <b>0</b></span><span>system <b>47</b></span></span></div><div class="chips"><span class="chip chip--same" title="与上一次请求完全一致的前缀">未变前缀 2</span><span class="chip chip--add">新增 2</span><span class="chip chip--chg">与对侧同一步有差异</span></div><div class="bubble-body" data-filled="0"></div></div>
+</div>
+</div>
+<div class="row">
+<div class="cell cell--off" data-step="2">
+<div class="bubble bubble--diff" data-accent="1" data-side="off" data-step-index="2" data-diff="1" data-stepdiff="1" data-ord="3" data-msg="5" data-chars="93" data-reason="42" data-system="15" data-lcp="4"><div class="bubble-head"><span class="idx">气泡 3</span><span class="lbl">第 1 轮 · step 3</span><span class="step">2026-11-15T06:00:30.000Z</span><span class="totals"><span>消息 <b>5</b></span><span>字符 <b>93</b></span><span>reasoning <b>42</b></span><span>system <b>15</b></span></span></div><div class="chips"><span class="chip chip--same" title="与上一次请求完全一致的前缀">未变前缀 4</span><span class="chip chip--add">新增 1</span><span class="chip chip--lcpmatch" title="两侧同一气泡的 LCP 长度不同">LCP 与对侧差 +2</span><span class="chip chip--chg">与对侧同一步有差异</span></div><div class="bubble-body" data-filled="0"></div></div>
+</div>
+<div class="cell cell--on" data-step="2">
+<div class="bubble bubble--diff" data-accent="1" data-side="on" data-step-index="2" data-diff="1" data-stepdiff="1" data-ord="3" data-msg="5" data-chars="125" data-reason="42" data-system="47" data-lcp="2"><div class="bubble-head"><span class="idx">气泡 3</span><span class="lbl">第 1 轮 · step 3</span><span class="step">2026-11-15T06:00:30.000Z</span><span class="totals"><span>消息 <b>5</b></span><span>字符 <b>125</b></span><span>reasoning <b>42</b></span><span>system <b>47</b></span></span></div><div class="chips"><span class="chip chip--same" title="与上一次请求完全一致的前缀">未变前缀 2</span><span class="chip chip--add">新增 1</span><span class="chip chip--chg">变化 1</span><span class="chip chip--lcpmatch" title="两侧同一气泡的 LCP 长度不同">LCP 与对侧差 +2</span><span class="chip chip--chg">与对侧同一步有差异</span></div><div class="bubble-body" data-filled="0"></div></div>
+</div>
+</div>
+<div class="row">
+<div class="cell cell--off" data-step="3">
+<div class="bubble bubble--diff" data-accent="1" data-side="off" data-step-index="3" data-diff="1" data-stepdiff="1" data-ord="4" data-msg="7" data-chars="108" data-reason="42" data-system="15" data-lcp="5"><div class="bubble-head"><span class="idx">气泡 4</span><span class="lbl">第 2 轮 · step 4</span><span class="step">2026-11-15T06:00:40.000Z</span><span class="totals"><span>消息 <b>7</b></span><span>字符 <b>108</b></span><span>reasoning <b>42</b></span><span>system <b>15</b></span></span></div><div class="chips"><span class="chip chip--same" title="与上一次请求完全一致的前缀">未变前缀 5</span><span class="chip chip--add">新增 2</span><span class="chip chip--chg">与对侧同一步有差异</span></div><div class="bubble-body" data-filled="0"></div></div>
+</div>
+<div class="cell cell--on" data-step="3">
+<div class="bubble bubble--diff" data-accent="1" data-side="on" data-step-index="3" data-diff="1" data-stepdiff="1" data-ord="4" data-msg="8" data-chars="174" data-reason="42" data-system="47" data-lcp="5"><div class="bubble-head"><span class="idx">气泡 4</span><span class="lbl">第 2 轮 · step 4</span><span class="step">2026-11-15T06:00:40.000Z</span><span class="totals"><span>消息 <b>8</b></span><span>字符 <b>174</b></span><span>reasoning <b>42</b></span><span>system <b>47</b></span></span></div><div class="chips"><span class="chip chip--same" title="与上一次请求完全一致的前缀">未变前缀 5</span><span class="chip chip--add">新增 3</span><span class="chip chip--chg">与对侧同一步有差异</span></div><div class="bubble-body" data-filled="0"></div></div>
+</div>
+</div>
+<div class="row">
+<div class="cell cell--off" data-step="4">
+<div class="bubble bubble--diff" data-accent="2" data-side="off" data-step-index="4" data-diff="1" data-stepdiff="1" data-ord="5" data-msg="4" data-chars="61" data-reason="0" data-system="15" data-lcp="1"><div class="bubble-head"><span class="idx">气泡 5</span><span class="lbl">第 2 轮 · step 5</span><span class="step">2026-11-15T06:00:50.000Z</span><span class="totals"><span>消息 <b>4</b></span><span>字符 <b>61</b></span><span>reasoning <b>0</b></span><span>system <b>15</b></span></span></div><div class="chips"><span class="chip chip--same" title="与上一次请求完全一致的前缀">未变前缀 1</span><span class="chip chip--same">未变后缀 2</span><span class="chip chip--del">消失 3</span><span class="chip chip--chg">变化 1</span><span class="chip chip--chg">与对侧同一步有差异</span></div><div class="bubble-body" data-filled="0"></div></div>
+</div>
+<div class="cell cell--on" data-step="4">
+<div class="bubble bubble--diff" data-accent="2" data-side="on" data-step-index="4" data-diff="1" data-stepdiff="1" data-ord="5" data-msg="5" data-chars="127" data-reason="0" data-system="47" data-lcp="1"><div class="bubble-head"><span class="idx">气泡 5</span><span class="lbl">第 2 轮 · step 5</span><span class="step">2026-11-15T06:00:50.000Z</span><span class="totals"><span>消息 <b>5</b></span><span>字符 <b>127</b></span><span>reasoning <b>0</b></span><span>system <b>47</b></span></span></div><div class="chips"><span class="chip chip--same" title="与上一次请求完全一致的前缀">未变前缀 1</span><span class="chip chip--same">未变后缀 3</span><span class="chip chip--del">消失 3</span><span class="chip chip--chg">变化 1</span><span class="chip chip--chg">与对侧同一步有差异</span></div><div class="bubble-body" data-filled="0"></div></div>
+</div>
+</div>
+<div class="row">
+<div class="cell cell--off" data-step="5">
+<div class="empty">这一侧没有这一步</div>
+</div>
+<div class="cell cell--on" data-step="5">
+<div class="bubble bubble--diff" data-accent="2" data-side="on" data-step-index="5" data-diff="1" data-stepdiff="1" data-ord="6" data-msg="3" data-chars="73" data-reason="0" data-system="47" data-lcp="1"><div class="bubble-head"><span class="idx">气泡 6</span><span class="lbl">第 3 轮 · step 6</span><span class="step">2026-11-15T06:01:00.000Z</span><span class="totals"><span>消息 <b>3</b></span><span>字符 <b>73</b></span><span>reasoning <b>0</b></span><span>system <b>47</b></span></span></div><div class="chips"><span class="chip chip--same" title="与上一次请求完全一致的前缀">未变前缀 1</span><span class="chip chip--del">消失 2</span><span class="chip chip--chg">变化 2</span><span class="chip chip--lcpmatch" title="两侧同一气泡的 LCP 长度不同">LCP 与对侧差 -1</span><span class="chip chip--chg">与对侧同一步有差异</span></div><div class="bubble-body" data-filled="0"></div></div>
+</div>
+</div>
+</div>
+<div class="empty" id="no-diff" style="display:none">两侧这一步没有差异</div>
+</section>
+</main>
+<section class="summary">
+<h2><span class="bar"></span>逐 step 对比<span class="t-sub">左：不启用插件 · 右：启用插件</span></h2>
+<table><thead><tr>
+<th>步</th><th>轮</th>
+<th>消息数(左)</th><th>消息数(右)</th><th>差</th>
+<th>字符数(左)</th><th>字符数(右)</th><th>差</th>
+<th>reasoning(左)</th><th>reasoning(右)</th><th>差</th>
+<th>LCP(左)</th><th>LCP(右)</th><th>LCP差</th>
+<th>说明</th>
+</tr></thead><tbody>
+<tr class="diff">
+<td class="mono">1</td>
+<td class="mono">1</td>
+<td class="mono">2</td>
+<td class="mono">2</td>
+<td class="flat">0</td>
+<td class="mono">54</td>
+<td class="mono">86</td>
+<td class="up">+32</td>
+<td class="mono">0</td>
+<td class="mono">0</td>
+<td class="flat">0</td>
+<td class="mono">0</td>
+<td class="mono">0</td>
+<td class="mono flat">0</td>
+<td class="notes">字符 +32</td>
+</tr>
+<tr class="diff">
+<td class="mono">2</td>
+<td class="mono">1</td>
+<td class="mono">4</td>
+<td class="mono">4</td>
+<td class="flat">0</td>
+<td class="mono">79</td>
+<td class="mono">111</td>
+<td class="up">+32</td>
+<td class="mono">27</td>
+<td class="mono">0</td>
+<td class="down">-27</td>
+<td class="mono">2</td>
+<td class="mono">2</td>
+<td class="mono flat">0</td>
+<td class="notes">字符 +32、reasoning -27</td>
+</tr>
+<tr class="lcp-diff">
+<td class="mono">3</td>
+<td class="mono">1</td>
+<td class="mono">5</td>
+<td class="mono">5</td>
+<td class="flat">0</td>
+<td class="mono">93</td>
+<td class="mono">125</td>
+<td class="up">+32</td>
+<td class="mono">42</td>
+<td class="mono">42</td>
+<td class="flat">0</td>
+<td class="mono">4</td>
+<td class="mono">2</td>
+<td class="mono up">+2</td>
+<td class="notes">字符 +32、LCP 差 +2</td>
+</tr>
+<tr class="diff">
+<td class="mono">4</td>
+<td class="mono">2</td>
+<td class="mono">7</td>
+<td class="mono">8</td>
+<td class="up">+1</td>
+<td class="mono">108</td>
+<td class="mono">174</td>
+<td class="up">+66</td>
+<td class="mono">42</td>
+<td class="mono">42</td>
+<td class="flat">0</td>
+<td class="mono">5</td>
+<td class="mono">5</td>
+<td class="mono flat">0</td>
+<td class="notes">字符 +66、消息数 +1</td>
+</tr>
+<tr class="diff">
+<td class="mono">5</td>
+<td class="mono">2</td>
+<td class="mono">4</td>
+<td class="mono">5</td>
+<td class="up">+1</td>
+<td class="mono">61</td>
+<td class="mono">127</td>
+<td class="up">+66</td>
+<td class="mono">0</td>
+<td class="mono">0</td>
+<td class="flat">0</td>
+<td class="mono">1</td>
+<td class="mono">1</td>
+<td class="mono flat">0</td>
+<td class="notes">字符 +66、消息数 +1</td>
+</tr>
+<tr class="lcp-diff">
+<td class="mono">6</td>
+<td class="mono">3</td>
+<td class="mono">—</td>
+<td class="mono">3</td>
+<td class="flat">—</td>
+<td class="mono">—</td>
+<td class="mono">73</td>
+<td class="flat">—</td>
+<td class="mono">—</td>
+<td class="mono">0</td>
+<td class="flat">—</td>
+<td class="mono">—</td>
+<td class="mono">1</td>
+<td class="mono up">-1</td>
+<td class="notes">仅右侧有此步</td>
+</tr>
+<tr class="totals-row">
+<td>合计</td><td>—</td>
+<td class="mono">4</td>
+<td class="mono">3</td>
+<td class="down">-1</td>
+<td class="mono">61</td>
+<td class="mono">73</td>
+<td class="up">+12</td>
+<td class="mono">0</td>
+<td class="mono">0</td>
+<td class="flat">0</td>
+<td class="mono">—</td><td class="mono">—</td><td class="mono">—</td>
+<td class="notes">累计节省 228 字符</td>
+</tr>
+</tbody></table>
+</section>
+<script>window.__PAYLOAD__={"meta":{"generatedAt":"2026-11-15T07:39:12.813Z","title":"示例：记忆插件启用/禁用的上下文对比（夹具数据）","runIds":"run-2026-11-15-on | run-2026-11-15-off","provider":"deepseek","model":"deepseek-chat","warnings":[],"buildMs":7,"maxChars":20000,"previewChars":220,"maxOps":200,"totalSteps":6,"truncatedMessages":0},"roles":["system","user","assistant"],"tools":[],"pool":["你是一个命令行助手。回答简洁。","帮我看看这个仓库的结构，然后写一个 TS 工具把 JSONL 转成 HTML。","好的，我先列一下目录结构。","继续，把增量对比做出来。","已经写好生成器了，编译通过。","再补一个汇总表。","汇总表加好了。","[历史摘要] 前面讨论了 JSONL→HTML 生成器的实现。","你是一个命令行助手。回答简洁。\n\n[记忆] 用户偏好：中文回复；曾要求把临时脚本放到任务目录。","[相关记忆] 你在上一轮说要把临时脚本集中放到任务目录，结束时清理。","最后跑一遍验证。","另外我检查了浏览器控制台，没有报错。"],"rpool":["用户要做 JSONL→HTML。先看目录，确认技术栈。","增量对比用 LCP 找分界点。"],"pairs":[{"key":"session-demo-0001","title":"session-demo-0001","subtitle":"左侧 5 步 · 右侧 6 步","off":{"key":"off","title":"不启用插件","subtitle":"session-demo-0001 · run-2026-11-15-off · 5 次请求","steps":[{"key":"off-0","step":1,"turn":1,"ts":"2026-11-15T06:00:10.000Z","ordinal":1,"totals":[2,54,0,15],"lcp":0,"pre":0,"preRoles":"","suf":0,"sufRoles":"","ops":[[1,0,15,0,-1,0,-1,-1,-1,15],[1,1,39,1,-1,1,-1,-1,-1,39]],"hiddenOps":0,"accent":1,"counts":[0,2,0,0,0],"cross":1,"lcpDelta":0,"hasDiff":true},{"key":"off-1","step":2,"turn":1,"ts":"2026-11-15T06:00:20.000Z","ordinal":2,"totals":[4,79,27,15],"lcp":2,"pre":2,"preRoles":"system×1 user×1","suf":0,"sufRoles":"","ops":[[1,2,13,2,-1,2,-1,0,-1,40],[1,1,12,3,-1,3,-1,-1,-1,12]],"hiddenOps":0,"accent":1,"counts":[2,2,0,0,0],"cross":1,"lcpDelta":0,"hasDiff":true},{"key":"off-2","step":3,"turn":1,"ts":"2026-11-15T06:00:30.000Z","ordinal":3,"totals":[5,93,42,15],"lcp":4,"pre":4,"preRoles":"system×1 user×2 assistant×1","suf":0,"sufRoles":"","ops":[[1,2,14,4,-1,4,-1,1,-1,29]],"hiddenOps":0,"accent":1,"counts":[4,1,0,0,0],"cross":1,"lcpDelta":2,"hasDiff":true},{"key":"off-3","step":4,"turn":2,"ts":"2026-11-15T06:00:40.000Z","ordinal":4,"totals":[7,108,42,15],"lcp":5,"pre":5,"preRoles":"system×1 user×2 assistant×2","suf":0,"sufRoles":"","ops":[[1,1,8,5,-1,5,-1,-1,-1,8],[1,2,7,6,-1,6,-1,-1,-1,7]],"hiddenOps":0,"accent":1,"counts":[5,2,0,0,0],"cross":1,"lcpDelta":0,"hasDiff":true},{"key":"off-4","step":5,"turn":2,"ts":"2026-11-15T06:00:50.000Z","ordinal":5,"totals":[4,61,0,15],"lcp":1,"pre":1,"preRoles":"system×1","suf":2,"sufRoles":"user×1 assistant×1","ops":[[4,1,31,1,1,7,1,-1,-1,-8],[2,2,13,-1,2,-1,2,-1,0,-40],[2,1,12,-1,3,-1,3,-1,-1,-12],[2,2,14,-1,4,-1,4,-1,1,-29]],"hiddenOps":0,"accent":2,"counts":[3,0,3,0,1],"cross":1,"lcpDelta":0,"hasDiff":true}]},"on":{"key":"on","title":"启用插件","subtitle":"session-demo-0001 · run-2026-11-15-on · 6 次请求","steps":[{"key":"on-0","step":1,"turn":1,"ts":"2026-11-15T06:00:10.000Z","ordinal":1,"totals":[2,86,0,47],"lcp":0,"pre":0,"preRoles":"","suf":0,"sufRoles":"","ops":[[1,0,47,0,-1,8,-1,-1,-1,47],[1,1,39,1,-1,1,-1,-1,-1,39]],"hiddenOps":0,"accent":1,"counts":[0,2,0,0,0],"cross":1,"lcpDelta":0,"hasDiff":true},{"key":"on-1","step":2,"turn":1,"ts":"2026-11-15T06:00:20.000Z","ordinal":2,"totals":[4,111,0,47],"lcp":2,"pre":2,"preRoles":"system×1 user×1","suf":0,"sufRoles":"","ops":[[1,2,13,2,-1,2,-1,-1,-1,13],[1,1,12,3,-1,3,-1,-1,-1,12]],"hiddenOps":0,"accent":1,"counts":[2,2,0,0,0],"cross":1,"lcpDelta":0,"hasDiff":true},{"key":"on-2","step":3,"turn":1,"ts":"2026-11-15T06:00:30.000Z","ordinal":3,"totals":[5,125,42,47],"lcp":2,"pre":2,"preRoles":"system×1 user×1","suf":0,"sufRoles":"","ops":[[3,2,13,2,2,2,2,0,-1,27],[0,1,12,3,3,3,3,-1,-1,0],[1,2,14,4,-1,4,-1,1,-1,29]],"hiddenOps":0,"accent":1,"counts":[3,1,0,1,0],"cross":1,"lcpDelta":2,"hasDiff":true},{"key":"on-3","step":4,"turn":2,"ts":"2026-11-15T06:00:40.000Z","ordinal":4,"totals":[8,174,42,47],"lcp":5,"pre":5,"preRoles":"system×1 user×2 assistant×2","suf":0,"sufRoles":"","ops":[[1,1,8,5,-1,5,-1,-1,-1,8],[1,2,7,6,-1,6,-1,-1,-1,7],[1,1,34,7,-1,9,-1,-1,-1,34]],"hiddenOps":0,"accent":1,"counts":[5,3,0,0,0],"cross":1,"lcpDelta":0,"hasDiff":true},{"key":"on-4","step":5,"turn":2,"ts":"2026-11-15T06:00:50.000Z","ordinal":5,"totals":[5,127,0,47],"lcp":1,"pre":1,"preRoles":"system×1","suf":3,"sufRoles":"user×2 assistant×1","ops":[[4,1,31,1,1,7,1,-1,-1,-8],[2,2,13,-1,2,-1,2,-1,0,-40],[2,1,12,-1,3,-1,3,-1,-1,-12],[2,2,14,-1,4,-1,4,-1,1,-29]],"hiddenOps":0,"accent":2,"counts":[4,0,3,0,1],"cross":1,"lcpDelta":0,"hasDiff":true},{"key":"on-5","step":6,"turn":3,"ts":"2026-11-15T06:01:00.000Z","ordinal":6,"totals":[3,73,0,47],"lcp":1,"pre":1,"preRoles":"system×1","suf":0,"sufRoles":"","ops":[[4,1,8,1,1,10,7,-1,-1,-23],[2,1,8,-1,2,-1,5,-1,-1,-8],[3,2,18,2,3,11,6,-1,-1,11],[2,1,34,-1,4,-1,9,-1,-1,-34]],"hiddenOps":0,"accent":2,"counts":[1,0,2,1,1],"cross":1,"lcpDelta":-1,"hasDiff":true}]},"rows":[{"key":"row-0","step":1,"turn":1,"hasOff":true,"hasOn":true,"lcpOff":0,"lcpOn":0,"lcpDelta":0,"diff":true,"notes":["字符 +32"]},{"key":"row-1","step":2,"turn":1,"hasOff":true,"hasOn":true,"lcpOff":2,"lcpOn":2,"lcpDelta":0,"diff":true,"notes":["字符 +32","reasoning -27"]},{"key":"row-2","step":3,"turn":1,"hasOff":true,"hasOn":true,"lcpOff":4,"lcpOn":2,"lcpDelta":2,"diff":true,"notes":["字符 +32","LCP 差 +2"]},{"key":"row-3","step":4,"turn":2,"hasOff":true,"hasOn":true,"lcpOff":5,"lcpOn":5,"lcpDelta":0,"diff":true,"notes":["字符 +66","消息数 +1"]},{"key":"row-4","step":5,"turn":2,"hasOff":true,"hasOn":true,"lcpOff":1,"lcpOn":1,"lcpDelta":0,"diff":true,"notes":["字符 +66","消息数 +1"]},{"key":"row-5","step":6,"turn":3,"hasOff":false,"hasOn":true,"lcpOff":0,"lcpOn":1,"lcpDelta":-1,"diff":true,"notes":["仅右侧有此步"]}]}],"summary":{"offFinal":[4,61,0,15],"onFinal":[3,73,0,47],"savedChars":-228,"savedMessages":-2,"peakSavedChars":0,"steps":6}};</script>
+<script>
+(function(){
+  var DATA = window.__PAYLOAD__;
+  var PREVIEW = DATA.meta.previewChars || 220;
+  var ROLES = DATA.roles;
+  var POOL = DATA.pool;
+  var RPOOL = DATA.rpool;
+
+  // ── 正文池取用（压缩态显示前 N 字 + 展开按钮）─────────────────
+  function esc(s){
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  function fmt(n){ return Number(n).toLocaleString('en-US'); }
+
+  function previewText(text){
+    if (!text) return '（空）';
+    if (text.length <= PREVIEW) return esc(text);
+    return esc(text.slice(0, PREVIEW)) + '\n… （共 ' + fmt(text.length) + ' 字符，已截断）';
+  }
+
+  // 紧凑操作数组：[kind, role, chars, curIndex, oldIndex, newPid, oldPid, newRpid, oldRpid, delta]
+  var KIND_LABEL = ['未变', '新增', '消失', '增长', '变化'];
+
+  function renderOp(op){
+    var kind = op[0];
+    var role = ROLES[op[1]] || 'unknown';
+    var chars = op[2];
+    var newPid = op[5], oldPid = op[6];
+    var newRpid = op[7], oldRpid = op[8];
+    var delta = op[9];
+    var text = kind === 2 ? (POOL[oldPid] || '') : (POOL[newPid] || '');
+    var reasoning = kind === 2 ? (RPOOL[oldRpid] || '') : (RPOOL[newRpid] || '');
+    var h = [];
+    h.push('<div class="op" data-kind="' + kind + '">');
+    h.push('<div class="k">' + KIND_LABEL[kind] + '</div>');
+    h.push('<div class="role">' + esc(role) + '</div>');
+    h.push('<div class="body">');
+    h.push('<div class="txt">' + previewText(text) + '</div>');
+    if (text.length > PREVIEW) h.push('<div class="more">展开全文</div>');
+    if (reasoning) {
+      h.push('<div class="reasoning"><span class="lbl">reasoning</span>');
+      h.push('<div class="txt">' + previewText(reasoning) + '</div>');
+      if (reasoning.length > PREVIEW) h.push('<div class="more">展开全文</div>');
+      h.push('</div>');
+    }
+    if (kind === 3 || kind === 4) {
+      h.push('<div class="old"><span class="lbl">上一次</span>');
+      h.push('<div class="txt">' + previewText(POOL[oldPid] || '') + '</div>');
+      h.push('</div>');
+    }
+    h.push('</div>');
+    h.push('<div class="size">' + fmt(chars) + ' 字符' +
+      (delta !== 0 ? ' · ' + (delta > 0 ? '+' : '') + fmt(delta) : '') + '</div>');
+    h.push('</div>');
+    return h.join('');
+  }
+
+  /** 填充一个气泡的正文区（虚拟化：只在进入视口时才填） */
+  function fillBubble(bubble){
+    if (bubble.getAttribute('data-filled') === '1') return;
+    var stepIdx = parseInt(bubble.getAttribute('data-step-index'), 10);
+    var side = bubble.getAttribute('data-side');
+    var pair = DATA.pairs[0];
+    if (!pair || isNaN(stepIdx)) return;
+    var sideObj = side === 'on' ? pair.on : pair.off;
+    var step = sideObj.steps[stepIdx];
+    if (!step) return;
+    var body = bubble.querySelector('.bubble-body');
+    if (!body) return;
+    var h = [];
+    // 未变前缀
+    if (step.pre > 0) {
+      h.push('<div class="unchanged">');
+      h.push('<span>前 ' + step.pre + ' 条与上一次完全相同</span>');
+      if (step.preRoles) h.push('<span class="mono">' + esc(step.preRoles) + '</span>');
+      h.push('<span class="expand">查看</span>');
+      h.push('<div class="detail"><div class="mono" style="font-size:11px;color:var(--faint)">正文未变（内容哈希相同），此处仅标注条数与角色分布，不重复展开全文。</div></div>');
+      h.push('</div>');
+    }
+    if (step.suf > 0) {
+      h.push('<div class="unchanged">');
+      h.push('<span>末 ' + step.suf + ' 条与上一次相同</span>');
+      if (step.sufRoles) h.push('<span class="mono">' + esc(step.sufRoles) + '</span>');
+      h.push('</div>');
+    }
+    // 操作列表
+    if (!step.ops || step.ops.length === 0) {
+      h.push('<div class="hidden-note">本次没有任何内容变化。</div>');
+    } else {
+      h.push('<div class="ops">');
+      for (var i = 0; i < step.ops.length; i++) h.push(renderOp(step.ops[i]));
+      h.push('</div>');
+    }
+    if (step.hiddenOps > 0) {
+      h.push('<div class="hidden-note">另有 ' + fmt(step.hiddenOps) + ' 条操作已折叠（超过单气泡 ' + fmt(DATA.meta.maxOps) + ' 条上限）。</div>');
+    }
+    body.innerHTML = h.join('');
+    bubble.setAttribute('data-filled', '1');
+  }
+
+  // ── 虚拟化：只填可视区域附近的行 ──────────────────────────
+  var rows = document.querySelectorAll('.row');
+  var filledRows = new Set();
+  var fillRaf = 0;
+
+  function fillVisible(){
+    if (fillRaf) return;
+    fillRaf = window.requestAnimationFrame(function(){
+      fillRaf = 0;
+      var vh = window.innerHeight;
+      for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        if (r.classList.contains('hidden')) continue;
+        if (filledRows.has(i)) continue;
+        var rect = r.getBoundingClientRect();
+        // 上下各多留一屏，避免快速滚动时露白
+        if (rect.bottom < -vh || rect.top > vh * 2) continue;
+        filledRows.add(i);
+        var bubbles = r.querySelectorAll('.bubble');
+        for (var j = 0; j < bubbles.length; j++) fillBubble(bubbles[j]);
+      }
+    });
+  }
+
+  // ── 只看差异过滤 ─────────────────────────────
+  // 规则：气泡本身有内容变化（新增/消失/变化），
+  //      或同一序号的对面气泡与它存在跨侧差异（LCP 不同、字符数不同等），
+  //      就保留；否则隐藏。
+  // 注意：隐藏的是**整行**（左右两侧一起），否则左右会错位。
+  var diffOnly = true;
+  var diffToggle = document.getElementById('toggle-diff');
+  if(diffToggle){
+    diffToggle.checked = true;
+    diffToggle.addEventListener('change', function(){
+      diffOnly = diffToggle.checked;
+      applyDiffFilter();
+    });
+  }
+
+  function applyDiffFilter(){
+    for(var i=0;i<rows.length;i++){
+      var row = rows[i];
+      var bubbles = row.querySelectorAll('.bubble');
+      var keep = !diffOnly;
+      for(var j=0;j<bubbles.length && !keep;j++){
+        var b = bubbles[j];
+        if(b.getAttribute('data-diff') === '1' || b.getAttribute('data-stepdiff') === '1') keep = true;
+      }
+      row.classList.toggle('hidden', !keep);
+    }
+    var noDiff = document.getElementById('no-diff');
+    if(noDiff){
+      var anyVisible = document.querySelectorAll('.row:not(.hidden)').length;
+      noDiff.style.display = (diffOnly && anyVisible === 0) ? 'block' : 'none';
+    }
+    fillVisible();
+    updateStats();
+  }
+  // ── 全量/差异模式 ────────────────────────────
+  var modeSeg = document.getElementById('mode-seg');
+  if(modeSeg){
+    modeSeg.addEventListener('click', function(ev){
+      var btn = ev.target.closest('button');
+      if(!btn) return;
+      var mode = btn.getAttribute('data-mode');
+      var btns = modeSeg.querySelectorAll('button');
+      for(var i=0;i<btns.length;i++){
+        btns[i].classList.toggle('on', btns[i] === btn);
+      }
+      diffOnly = (mode === 'diff');
+      if(diffToggle) diffToggle.checked = diffOnly;
+      applyDiffFilter();
+    });
+  }
+
+  // ── 展开/收起正文 ────────────────────────────
+  document.addEventListener('click', function(ev){
+    var more = ev.target.closest('.more');
+    if(more){
+      var txt = more.parentNode.querySelector('.txt');
+      if(txt) txt.classList.toggle('full');
+      more.textContent = txt && txt.classList.contains('full') ? '收起' : '展开全文';
+      return;
+    }
+    var exp = ev.target.closest('.unchanged .expand');
+    if(exp){
+      var box = exp.closest('.unchanged');
+      if(box) box.classList.toggle('open');
+      return;
+    }
+    var bubble = ev.target.closest('.bubble');
+    if(bubble && !ev.target.closest('.more') && !ev.target.closest('.unchanged .expand')){
+      // 点击气泡标题区域 → 切换该气泡的明细折叠
+      var ops = bubble.querySelector('.ops');
+      if(ops && ev.target.closest('.bubble-head')){
+        ops.classList.toggle('collapsed');
+      }
+    }
+  });
+
+  // ── 联动滚动（同一步对齐）────────────────────
+  // 布局本身已经是「一行 = 同一步的左右两个气泡」，所以同一步天然对齐；
+  // 联动滚动只需要在滚动时高亮当前所在的那一行。
+  var linkScroll = document.getElementById('toggle-link');
+  var rows = document.querySelectorAll('.row');
+  function markCurrent(){
+    if(!linkScroll || !linkScroll.checked) return;
+    var cur = -1, bestTop = Infinity;
+    for(var i=0;i<rows.length;i++){
+      var r = rows[i];
+      if(r.classList.contains('hidden')) continue;
+      var top = r.getBoundingClientRect().top;
+      if(top <= 170 && top > bestTop - 100000){
+        if(top > bestTop || cur < 0){ bestTop = top; cur = i; }
+      }
+    }
+    for(var j=0;j<rows.length;j++){
+      rows[j].classList.toggle('row--current', j === cur);
+    }
+  }
+  window.addEventListener('scroll', markCurrent, {passive:true});
+  window.addEventListener('scroll', fillVisible, {passive:true});
+  window.addEventListener('resize', markCurrent);
+  window.addEventListener('resize', fillVisible);
+
+  // ── 统计条随滚动更新 ─────────────────────────
+  // 用「可见行的下标区间」做增量定位，避免每次滚动都扫全部行。
+  var statOff = document.getElementById('stat-off');
+  var statOn = document.getElementById('stat-on');
+  var statTimer = 0;
+
+  function rowAt(idx){
+    var r = rows[idx];
+    if(!r || r.classList.contains('hidden')) return null;
+    return r;
+  }
+
+  function updateStats(){
+    var sides = [statOff, statOn];
+    // 二分找第一个「顶部已在统计条之上」的行
+    var lo = 0, hi = rows.length - 1, found = -1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      var r = rows[mid];
+      if (!r) { lo = mid + 1; continue; }
+      var top = r.getBoundingClientRect().top;
+      if (top <= 200) { found = mid; hi = mid - 1; }
+      else lo = mid + 1;
+    }
+    // 从 found 往前找最近的非隐藏行
+    var idx = -1;
+    for (var k = found; k >= 0 && k >= found - 50; k--) {
+      if (rowAt(k)) { idx = k; break; }
+    }
+    if (idx < 0) {
+      for (var k2 = 0; k2 < rows.length; k2++) {
+        if (rowAt(k2)) { idx = k2; break; }
+      }
+    }
+    for(var side=0; side<2; side++){
+      var el = sides[side];
+      if(!el || idx < 0) continue;
+      var row = rowAt(idx);
+      if (!row) continue;
+      var cur = row.querySelector('.cell--' + (side===0?'off':'on') + ' .bubble');
+      if(!cur) continue;
+      var msg = cur.getAttribute('data-msg') || '0';
+      var chars = cur.getAttribute('data-chars') || '0';
+      var reas = cur.getAttribute('data-reason') || '0';
+      var sys = cur.getAttribute('data-system') || '0';
+      var lcp = cur.getAttribute('data-lcp') || '0';
+      var ord = cur.getAttribute('data-ord') || '0';
+      var e2 = el.querySelector('[data-f="ord"]');
+      if(e2) e2.textContent = ord;
+      var e3 = el.querySelector('[data-f="msg"]');
+      if(e3) e3.textContent = msg;
+      var e4 = el.querySelector('[data-f="chars"]');
+      if(e4) e4.textContent = chars;
+      var e5 = el.querySelector('[data-f="reason"]');
+      if(e5) e5.textContent = reas;
+      var e6 = el.querySelector('[data-f="system"]');
+      if(e6) e6.textContent = sys;
+      var e7 = el.querySelector('[data-f="lcp"]');
+      if(e7) e7.textContent = lcp;
+    }
+  }
+  window.addEventListener('scroll', updateStats, {passive:true});
+  window.addEventListener('resize', updateStats);
+
+  // ── 会话切换 ─────────────────────────────────
+  var tabs = document.getElementById('session-tabs');
+  if(tabs){
+    tabs.addEventListener('click', function(ev){
+      var btn = ev.target.closest('button');
+      if(!btn) return;
+      var key = btn.getAttribute('data-key');
+      var btns = tabs.querySelectorAll('button');
+      for(var i=0;i<btns.length;i++) btns[i].classList.toggle('on', btns[i] === btn);
+      var blocks = document.querySelectorAll('.pair');
+      for(var i=0;i<blocks.length;i++){
+        blocks[i].classList.toggle('hidden', blocks[i].getAttribute('data-key') !== key);
+      }
+      applyDiffFilter();
+      window.scrollTo({top:0});
+    });
+  }
+
+  // 初始
+  applyDiffFilter();
+  updateStats();
+  fillVisible();
+})();
+</script>
+</body></html>
