@@ -8,6 +8,9 @@
  * 3. 落盘的 JSONL 行内容符合契约；
  * 4. 进程退出（dispose）前队列被排空。
  *
+ * 第 5 段额外验证**双栏采集**：`agent/pre-step` 的 waterfall 语义
+ * （cordis 的 waterfall 按注册顺序从外到内）与 before/after 的配对。
+ *
  * 用法：node scripts/integration-check.mjs
  */
 
@@ -39,6 +42,12 @@ function check(label, actual, expected) {
     failures += 1
     console.log(`  FAIL ${label}\n       actual:   ${JSON.stringify(actual)}\n       expected: ${JSON.stringify(expected)}`)
   }
+}
+
+/** 读回落盘文件的所有行（JSON 解析后）。 */
+async function readRecords(dir, file) {
+  const raw = await readFile(join(dir, file), 'utf8')
+  return raw.split('\n').filter(line => line.trim() !== '').map(line => JSON.parse(line))
 }
 
 // ── 组装真实运行时 ────────────────────────────────────────────────────────
@@ -81,15 +90,16 @@ check('适配器收到了完整 messages', seen[0]?.messages?.length, 2)
 
 console.log('\n[2] 落盘内容')
 await ctx.fiber.dispose()
-const raw = await readFile(join(outDir, fileName), 'utf8')
-const lines = raw.split('\n').filter(line => line.trim() !== '')
-check('写出一行', lines.length, 1)
-const record = JSON.parse(lines[0])
+const records = await readRecords(outDir, fileName)
+check('写出一行', records.length, 1)
+const record = records[0]
 check('provider', record.provider, 'fake-provider')
 check('model', record.model, 'fake-model')
 check('sessionId', record.sessionId, 'session-integration')
 check('variant', record.variant, 'on')
 check('runId', record.runId, 'run-integration')
+check('phase 缺省为 after', record.phase, 'after')
+check('requestKey 存在', typeof record.requestKey, 'string')
 check('messages 条数', record.messages.length, 2)
 check('messages 顺序', record.messages.map(m => m.role), ['system', 'user'])
 check('system 文本', record.messages[0].text, 'SYSTEM PROMPT')
@@ -101,7 +111,7 @@ check('totals.reasoningChars', record.totals.reasoningChars, 0)
 
 console.log('\n[3] dispose 前排空')
 // 上面 flush 发生在 dispose 之后仍然读到了内容，说明 dispose 的 effect 排空了队列。
-check('dispose 后文件已落盘', lines.length, 1)
+check('dispose 后文件已落盘', records.length, 1)
 
 console.log('\n[4] 大量请求的 dispose 排空')
 // 连发 200 次请求后立刻 dispose：dispose 的 effect 必须把队列全部写完。
@@ -122,13 +132,139 @@ for (let i = 0; i < 200; i += 1) {
   for await (const _chunk of s) { /* drain */ }
 }
 await bulkCtx.fiber.dispose()
-const bulkRaw = await readFile(join(bulkOutDir, bulkFile), 'utf8')
-const bulkLines = bulkRaw.split('\n').filter(line => line.trim() !== '')
-check('200 次请求全部落盘', bulkLines.length, 200)
-check('第一行是第 0 条', JSON.parse(bulkLines[0]).messages[0].text, 'msg-0')
-check('最后一行是第 199 条', JSON.parse(bulkLines[199]).messages[0].text, 'msg-199')
-check('顺序严格递增（无乱序）', bulkLines.every((line, index) => JSON.parse(line).messages[0].text === `msg-${index}`), true)
+const bulkRecords = await readRecords(bulkOutDir, bulkFile)
+check('200 次请求全部落盘', bulkRecords.length, 200)
+check('第一行是第 0 条', bulkRecords[0].messages[0].text, 'msg-0')
+check('最后一行是第 199 条', bulkRecords[199].messages[0].text, 'msg-199')
+check('顺序严格递增（无乱序）', bulkRecords.every((r, index) => r.messages[0].text === `msg-${index}`), true)
 await rm(bulkOutDir, { recursive: true, force: true })
+
+// ── 第 5 段：双栏采集（before / after） ─────────────────────────────────────
+//
+// 用**真实的 cordis waterfall** 模拟 dsh 的 pre-step → llm/stream 时序：
+//   1. 挂一个「记忆注入」pre-step 监听器；
+//   2. 挂本插件的 pre-step 监听器（prepend → 排在最外层）；
+//   3. 触发 pre-step waterfall；
+//   4. 触发 llm/stream waterfall。
+//
+// 校验：before 栏不含注入内容，after 栏含注入内容，两栏共用同一个 requestKey。
+console.log('\n[5] 双栏采集：before / after')
+const dualOutDir = join(tmpdir(), `mdc-dual-${process.pid}`)
+const dualFile = 'dual.jsonl'
+const dualCtx = new Context()
+await dualCtx.plugin(LlmRuntime)
+dualCtx.llm.registerAdapter(['fake-provider'], new FakeAdapter())
+
+const HISTORY = [
+  { role: 'system', content: [{ type: 'text', text: 'SYSTEM' }] },
+  { role: 'user', content: [{ type: 'text', text: '原始问题' }] },
+]
+const INJECTED = { role: 'user', content: [{ type: 'text', text: '[记忆] 上次提到 pnpm' }] }
+
+// 模拟 dsh 的会话：deriveMessages() 返回当前派生历史（pre-step 时刻不含本步新增）。
+let derived = HISTORY.slice()
+const fakeSession = {
+  id: 'session-dual',
+  deriveMessages: () => derived.slice(),
+}
+
+// 「记忆注入」监听器：普通注册 → 排在内层。
+dualCtx.on('agent/pre-step', async (payload, next) => {
+  const decision = await next()
+  if (decision.kind === 'reject') return decision
+  // 模拟记忆机制：往本步批次里追加一条注入消息。
+  return { ...decision, messages: [...decision.messages, INJECTED] }
+}, { global: true })
+
+// 本插件：prepend → 排在最外层 → 拿到的是注入之后的结果。
+apply(dualCtx, { outDir: dualOutDir, fileName: dualFile, variant: 'on', runId: 'run-dual' })
+
+// 触发一次 pre-step waterfall。
+const decision = await dualCtx.waterfall('agent/pre-step', {
+  agent: { session: fakeSession },
+  messages: [],
+  turn: 1,
+  step: 1,
+}, async () => ({ kind: 'enter', messages: HISTORY.slice() }))
+check('pre-step 决策被注入器改写（多一条）', decision.messages.length, 3)
+
+// 触发一次 llm/stream waterfall（发出去的上下文 = 派生历史 + 本步批次）。
+const finalMessages = [...derived, ...decision.messages]
+const s = dualCtx.llm.stream({
+  provider: 'fake-provider',
+  model: 'fake-model',
+  messages: finalMessages,
+  sessionId: 'session-dual',
+})
+// eslint-disable-next-line no-empty
+for await (const _chunk of s) { /* drain */ }
+await dualCtx.fiber.dispose()
+
+const dualRecords = await readRecords(dualOutDir, dualFile)
+check('写出两行（before + after）', dualRecords.length, 2)
+const beforeRow = dualRecords.find(r => r.phase === 'before')
+const afterRow = dualRecords.find(r => r.phase === 'after')
+check('存在 before 行', beforeRow !== undefined, true)
+check('存在 after 行', afterRow !== undefined, true)
+check('两行共用 requestKey', beforeRow?.requestKey === afterRow?.requestKey, true)
+check('requestKey 形如 session#turn#step', beforeRow?.requestKey, 'session-dual#1#1')
+check('before 不含注入内容', beforeRow?.messages.some(m => m.text.includes('[记忆]')), false)
+check('after 含注入内容', afterRow?.messages.some(m => m.text.includes('[记忆]')), true)
+check('before 条数少于 after', (beforeRow?.messages.length ?? 0) < (afterRow?.messages.length ?? 0), true)
+check('before 的字符数少于 after', (beforeRow?.totals.chars ?? 0) < (afterRow?.totals.chars ?? 0), true)
+await rm(dualOutDir, { recursive: true, force: true })
+
+// ── 第 6 段：prepend 顺序 ─────────────────────────────────────────────────
+//
+// 关键：只有**最外层**的 pre-step 监听器才能拿到「所有其它监听器改完之后」的
+// 决定。本插件用 prepend 把自己放到最外层，所以它看到的批次里**含**注入。
+console.log('\n[6] prepend：拿到其它监听器改完之后的批次')
+const orderOutDir = join(tmpdir(), `mdc-order-${process.pid}`)
+const orderFile = 'order.jsonl'
+const orderCtx = new Context()
+await orderCtx.plugin(LlmRuntime)
+orderCtx.llm.registerAdapter(['fake-provider'], new FakeAdapter())
+
+// 内层监听器：注入一条消息。
+orderCtx.on('agent/pre-step', async (payload, next) => {
+  const decision = await next()
+  if (decision.kind === 'reject') return decision
+  return { ...decision, messages: [...decision.messages, INJECTED] }
+}, { global: true })
+
+// 本插件（prepend → 最外层）。
+apply(orderCtx, { outDir: orderOutDir, fileName: orderFile, variant: 'on', runId: 'run-order' })
+
+const orderSession = { id: 'session-order', deriveMessages: () => HISTORY.slice() }
+const orderDecision = await orderCtx.waterfall('agent/pre-step', {
+  agent: { session: orderSession },
+  messages: [],
+  turn: 1,
+  step: 1,
+}, async () => ({ kind: 'enter', messages: HISTORY.slice() }))
+check('内层监听器确实改写了批次', orderDecision.messages.length, 3)
+
+const orderStream = orderCtx.llm.stream({
+  provider: 'fake-provider',
+  model: 'fake-model',
+  messages: [...HISTORY, ...orderDecision.messages],
+  sessionId: 'session-order',
+})
+// eslint-disable-next-line no-empty
+for await (const _chunk of orderStream) { /* drain */ }
+await orderCtx.fiber.dispose()
+
+const orderRecords = await readRecords(orderOutDir, orderFile)
+const orderBefore = orderRecords.find(r => r.phase === 'before')
+const orderAfter = orderRecords.find(r => r.phase === 'after')
+check('before 行存在（说明插件作为最外层监听器跑到了）', orderBefore !== undefined, true)
+check('after 行存在', orderAfter !== undefined, true)
+// before = after − 本步新增：本步新增含注入，所以 before 里没有注入。
+check('before 不含注入内容', orderBefore?.messages.some(m => m.text.includes('[记忆]')), false)
+check('after 含注入内容', orderAfter?.messages.some(m => m.text.includes('[记忆]')), true)
+// before 仍保留历史（含系统提示词，它是固定前缀不是注入）。
+check('before 保留历史消息', orderBefore?.messages.some(m => m.text.includes('原始问题')), true)
+await rm(orderOutDir, { recursive: true, force: true })
 
 await rm(outDir, { recursive: true, force: true })
 

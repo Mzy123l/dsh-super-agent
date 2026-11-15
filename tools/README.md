@@ -1,7 +1,16 @@
-# gen-memory-debug — 上下文增量对比 HTML 生成器
+# gen-memory-debug — 上下文对比 HTML 生成器
 
-把两轮采集到的上下文 JSONL（每轮 = 一个 session 的完整消息序列）渲染成一个**自包含 HTML**，
-左右横向对比「不启用插件」与「启用插件」两条链路的上下文构成。
+把采集到的上下文 JSONL 渲染成一个**自包含 HTML**，左右横向对比两栏上下文。
+
+支持**两种模式**：
+
+| 模式 | 左栏 | 右栏 | 配对依据 | 何时用 |
+|---|---|---|---|---|
+| **同轮双栏**（`phase`） | 原版上下文（介入前） | 新版上下文（介入后） | `requestKey` | **默认**：记忆机制介入前 vs 介入后 |
+| **A/B 两轮**（`variant`） | 不启用插件的一轮 | 启用插件的一轮 | 气泡序号 | 旧采集文件（无 `phase` 字段） |
+
+模式**自动探测**：只要输入里有 `phase: 'before'` 的行，就走同轮双栏模式；
+否则走 A/B 两轮模式。也可以用 `--mode` 强制。
 
 ## 快速开始
 
@@ -10,14 +19,20 @@ cd tools
 npm install
 npx tsc -p tsconfig.json
 
-# 两侧各一个文件
+# 同轮双栏（同一个文件同时含 before 与 after 行时，只给一次）
 node dist/gen-memory-debug.js \
-  --on  ../capture/capture-on.jsonl \
-  --off ../capture/capture-off.jsonl \
-  --out ../memory-debug.html
+  --before ../captures/capture-run-01.jsonl \
+  --after  ../captures/capture-run-01.jsonl \
+  --out    ../memory-debug.html
 
-# 目录模式：读出目录下所有 .jsonl，按每行的 variant 字段分流
-node dist/gen-memory-debug.js --dir ../capture --out ../memory-debug.html
+# 目录模式：读出目录下所有 .jsonl，按每行的 phase / variant 字段分流
+node dist/gen-memory-debug.js --dir ../captures --out ../memory-debug.html
+
+# A/B 两轮（旧格式）
+node dist/gen-memory-debug.js \
+  --on  ../captures/capture-on.jsonl \
+  --off ../captures/capture-off.jsonl \
+  --out ../memory-debug.html
 ```
 
 输出 `memory-debug.html` 直接双击打开即可（单文件，零外部依赖，无网络请求）。
@@ -26,15 +41,20 @@ node dist/gen-memory-debug.js --dir ../capture --out ../memory-debug.html
 
 | 参数 | 说明 | 默认 |
 | --- | --- | --- |
-| `--on <path>` | 启用插件一侧的 JSONL（可重复） | — |
-| `--off <path>` | 不启用插件一侧的 JSONL（可重复） | — |
-| `--dir <path>` | 目录：递归读出全部 `.jsonl`，按每行的 `variant` 字段分流 | — |
+| `--before <path>` | 原版上下文一侧的 JSONL（可重复） | — |
+| `--after <path>` | 新版上下文一侧的 JSONL（可重复） | — |
+| `--on <path>` | 启用插件一侧的 JSONL（旧格式，可重复） | — |
+| `--off <path>` | 不启用插件一侧的 JSONL（旧格式，可重复） | — |
+| `--dir <path>` | 目录：递归读出全部 `.jsonl`，按每行的 `phase` / `variant` 字段分流 | — |
+| `--mode <m>` | 强制模式：`variant`（A/B 两轮）或 `phase`（同轮双栏） | 自动探测 |
 | `--out <path>` | 输出 HTML 路径 | `memory-debug.html` |
 | `--max-chars <n>` | 单条正文进入页面的字符上限（0 = 不截断） | `20000` |
 | `--preview <n>` | 折叠态每段显示的字符数 | `220` |
 | `--max-ops <n>` | 单个气泡最多渲染的操作条数（超出折叠） | `200` |
 | `--title <text>` | 页面标题 | 上下文增量对比 |
 | `--quiet` | 不打印摘要 | — |
+
+> 同一个文件被 `--before` 与 `--after` 同时指定时**只读一次**（按绝对路径去重）。
 
 ## 输入格式
 
@@ -47,6 +67,8 @@ node dist/gen-memory-debug.js --dir ../capture --out ../memory-debug.html
   "provider": "deepseek",
   "model": "deepseek-chat",
   "step": 3, "turn": 1, "variant": "on", "runId": "run-...",
+  "phase": "before",
+  "requestKey": "session-...#1#3",
   "messages": [
     { "role": "system", "text": "...", "chars": 1234 },
     { "role": "assistant", "text": "...", "chars": 56,
@@ -63,8 +85,36 @@ node dist/gen-memory-debug.js --dir ../capture --out ../memory-debug.html
 - `systemChars` = `role==="system"` 的 `text` 之和（是 `chars` 的**子集**）
 - `(turn, step)` 是序号二元组；`step` 每个 turn 重置为 1，**不能**单独当全局序号
 - `ts` 是主排序键（ISO 字符串，字典序 == 时间序）
+- **`phase`** = `'before'`（记忆机制介入前）| `'after'`（介入后，真正发给模型）
+- **`requestKey`** = 配对键，同一次请求的 before/after 共用
+
+### 向后兼容
 
 解析是**宽松**的：缺字段给默认值，未知键忽略，坏行跳过并计入页面上的告警区。
+
+- **`phase` 缺失 → 按 `'after'` 处理**（旧采集文件仍能渲染，走 A/B 两轮模式）。
+- **`requestKey` 缺失 → 按 `sessionId#turn#step` 兜底推导**（与采集插件格式一致）。
+
+## 两种模式的配对差异
+
+### 同轮双栏（`phase`）
+
+- 按 **`requestKey`** 精确配对：同一个 `requestKey` 的 before 行与 after 行配成一对。
+- 两侧**按槽位对齐**：某个 `requestKey` 只有 before 没有 after（或反之）时，
+  该槽位在另一侧留**空洞**，不会出现「A 请求的 before」和「B 请求的 after」被配成一对。
+- 汇总口径：**注入量 = 右栏 − 左栏**（正数 = 记忆机制往上下文里塞了东西）。
+
+> **为什么 phase 模式不比 LCP**：两侧的 LCP 是「各自相对自己上一次请求」算的，
+> 而 before/after 的历史**天然不同**（before 少一条本步新增），跨侧比 LCP 没有意义。
+> phase 模式只用**绝对量**（消息数 / 字符数 / reasoning 字符数）跨栏比较——
+> 那正是「记忆机制注入了多少」的直接答案。
+
+### A/B 两轮（`variant`）
+
+- 按 `variant` 分成 on/off 两组，各自按 `sessionId` 分会话。
+- 同一 `sessionId` 在两侧都出现 → 配成一对；只有一侧 → 另一侧留空，页面仍能看。
+- 两侧按**气泡序号**配对（最稳：两侧 step 号可能因插件行为不同而错位）。
+- 汇总口径：**节省量 = 左栏 − 右栏**（正数 = 插件省了上下文）。
 
 ## 增量算法（LCP 细节）
 
@@ -96,9 +146,9 @@ node dist/gen-memory-debug.js --dir ../capture --out ../memory-debug.html
 - 「同一条消息正文被改写」= `pid` 变了 → 判为**变化**或**增长**。
 - 「内容哈希相同」= 未变，**不做任何字符串比较**。
 
-### 两侧 LCP 长度不同 → 重要发现
+### 两侧 LCP 长度不同 → 重要发现（仅 variant 模式）
 
-两侧**各自独立**计算 LCP。同一序号（气泡 N）的两侧 LCP 长度不同时：
+variant 模式下两侧**各自独立**计算 LCP。同一序号（气泡 N）的两侧 LCP 长度不同时：
 
 - 气泡上打黄色高亮标签「LCP 与对侧差 ±N」
 - 气泡整体加黄色描边（`bubble--diff`）
@@ -113,13 +163,13 @@ node dist/gen-memory-debug.js --dir ../capture --out ../memory-debug.html
 ├─────────────────────────────────────────────────────────┤
 │ 工具条：只看差异 / 全量 · 联动滚动开关                    │
 ├─────────────────────────────────────────────────────────┤
-│ 概览卡：不启用最终值 / 启用最终值 / 累计节省 / 单步最大节省│
+│ 概览卡：原版最终值 / 新版最终值 / 累计注入 / 单次最大注入 │
 ├──────────────────────────┬──────────────────────────────┤
-│  左栏：variant=off       │  右栏：variant=on             │
+│  左栏：phase=before       │  右栏：phase=after           │
 │  ● 气泡 1  step 1         │  ● 气泡 1  step 1            │
 │  ● 气泡 2  step 2         │  ● 气泡 2  step 2            │
 ├──────────────────────────┴──────────────────────────────┤
-│ 底部：逐 step 对比表 + 总节省量                          │
+│ 底部：逐请求对比表 + 总注入量                            │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -153,7 +203,7 @@ node dist/gen-memory-debug.js --dir ../capture --out ../memory-debug.html
 
 ```bash
 npx tsc -p tsconfig.json                       # 编译
-node --test "dist/tests/*.test.js"             # 单元测试（12 项）
+node --test "dist/tests/*.test.js"             # 单元测试（27 项）
 node dist/scripts/make-fixture.js ../.tmp/fixtures   # 造合成夹具
 node dist/scripts/serve.js ../.tmp/fixtures 8731     # 本地静态服务（浏览器验证用）
 node dist/scripts/verify.js <url> <outDir>          # 无头浏览器验证（截图 + 控制台）
@@ -167,13 +217,15 @@ tools/
 ├── gen-memory-debug.ts      CLI 入口
 ├── lib/
 │   ├── types.ts             数据模型
-│   ├── reader.ts            JSONL 流式读取 + 宽松解析
+│   ├── reader.ts            JSONL 流式读取 + 宽松解析（phase / requestKey）
 │   ├── diff.ts              增量 diff 引擎（LCP + suffix + LCS）
 │   ├── pool.ts              正文池（去重 + 截断）
-│   ├── model.ts             分组、配对、跨侧比较、池裁剪
+│   ├── model.ts             分组、配对、跨侧比较、池裁剪（两种模式）
 │   └── render.ts            HTML 渲染（内联 CSS/JS + 客户端虚拟化）
 ├── scripts/                 夹具 / 静态服务 / 无头验证 / 压测
-└── tests/diff.test.ts       diff 引擎单元测试
+└── tests/
+    ├── diff.test.ts         diff 引擎单元测试
+    └── phase.test.ts        phase 解析 + 双栏配对单元测试
 ```
 
 运行时零依赖（只用 Node 内置模块）。TypeScript 与 `@types/node` 是开发期依赖。

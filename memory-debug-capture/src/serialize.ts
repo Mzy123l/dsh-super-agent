@@ -26,6 +26,22 @@ export interface SourceMessage {
   role: string
   content?: readonly SourceContentBlock[]
   toolCallId?: string
+  /**
+   * 消息的稳定身份（dsh 的 `Message.id`，一个 UUID）。
+   *
+   * 用来跨捕获点识别「同一条消息」：pre-step 决策里的消息与
+   * `llm/stream` 里的消息是**不同对象**（会话日志存的是 JSON 快照），
+   * 但 `id` 相同。
+   */
+  id?: string
+  /**
+   * 消息来源（dsh 的 `Message.source`）。
+   *
+   * `kind` 回答「**谁产出了这条消息**」：`'user'` 是用户输入，
+   * `'system-prompt'` 是 dsh 渲染的系统提示词，其余是各插件声明的
+   * 注入种类（可扩展的联合类型）。
+   */
+  source?: { kind?: string } | undefined
 }
 
 /** 序列化选项。 */
