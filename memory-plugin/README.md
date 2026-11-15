@@ -1,91 +1,282 @@
-# memory-plugin — DSH 会话记忆插件（纯理论实现）
+# memory-plugin — DSH 会话记忆插件
 
-## 与规格的偏差（先读这段）
+把长会话的每一段内容编上号，让模型自己写摘要，老化的内容只发摘要，随时能取回原文。
 
-按 [9O 规格](../docs/9O-memory-plugin-spec.md) 实现，以下偏差需要知道：
+许可证：[GPL-3.0-or-later](../LICENSE)
 
-| 偏差 | 说明 |
-| --- | --- |
-| 验收 1 的数字口径 | 真实数据实测 274 个会话文件（规格写作 245；实时增长），索引记录数见下方实测输出，量级与 9I 的 223,513 一致。 |
-| 向量维度/表 | 规格 §2.3 的 `vec0` 虚表未建——better-sqlite3 不带 sqlite-vec 扩展，向量走注入式 `VectorStore`（内存 Map 余弦 top-k，理论实现）；`NoopVectorStore` 下 vectors 计数恒为 0。规格也明确"向量维度与来源不写死、接口注入"。 |
-| FTS 中文分词 | unicode61 不分中文词，规格 §4.1 预告了局限。实现加了超出规格的补偿：索引侧 CJK 逐字分词 + 查询侧单字 phrase（`src/search/segment.ts`），"待办"能命中"记成待办"。这是字级匹配不是真分词，取舍见 DESIGN.md §3。 |
-| schema.sql 语义 | 规格 §2.3 的 `records` 主键 `(sessionId, seq, kind)` 原样保留；`vectors` 虚表换成注入式接口后，watermarks/meta 两张规格未画的表是增量索引与 status 的必要补充。 |
-| hybrid 实测范围 | hybrid 双路合并（RRF k=60）在单测中用 fake embedding 端到端验证；CLI 对真实数据默认 Noop（无 embedding key），故真实搜索实测都是 keyword 模式。 |
-| CLI 增加了 serve 子命令 | 规格 §5.2 只列 index/search/status；HTTP API（§5.1）需要一个入口，加了 `serve`。 |
-| 图片占位文本 | 规格示例"（图片，未索引）"，实现为通用占位"（未索引内容）"——日志事件里图片以 content block 出现，插件在 content 层无法区分图片与二进制。 |
-| build 用 tsc | 规格建议 tsdown 或 tsc；用 tsc + 5 行 postbuild 脚本复制 schema.sql，少一个依赖。 |
+---
 
-没做的（与规格 §7 一致）：不动 `~/.dsh`（除只读扫描 sessions）、不挂载 profile、不自动触发、不索引 spill 正文、不接真向量模型。
+## 它解决什么
 
-## 是什么
+长会话里，早期的思考、工具输出、正文会撑爆上下文，但它们的有效信息往往一两句就够。
 
-把 dsh 会话日志（`.jsonl.zstd`，拼接 zstd 帧）**复制**进插件自己的 SQLite 库，提供：
+dsh 自带的压缩是「满了才压、静默切头」——被压掉的内容模型完全看不见，只剩一段它没参与写的摘要。
 
-- **关键词搜索**（FTS5，全量记录，含被压缩遮蔽的事件，带 shadowed 标记）
-- **向量检索**（注入式 embedding，reasoning 只在这里可搜——决策①）
-- **双路合并**（RRF，k=60）
-- **只读 HTTP API**（为未来 Router/面板预留）
+这个插件换一条路：
 
-四条用户决策的落实细节见 [DESIGN.md](DESIGN.md)。
+- **每段内容编一个号（`#0` `#1` …）**，编号会话内线性递增，永不改变
+- **摘要由正在运行的模型自己写**，串行、当场写，不事后补
+- **近几十条发「摘要 + 原文」，更早的只发摘要**
+- **任何编号随时能取回完整原文**，包括已经不在上下文里的
 
-## 用法
+原文永远留在库里，一个字都不删。
+
+---
+
+## 核心概念
+
+### 编号单位
+
+每个独立单元占一个编号，会话内从 0 开始线性递增：
+
+| 单位类型 | 来源 | 说明 |
+| --- | --- | --- |
+| `user` | 用户消息 | 永不衰减，永远发原文 |
+| `thinking` | 模型思考块 | 长单位必有摘要 |
+| `tool` | 工具调用 + 结果 | **合并为一个单位**，内部用标签区分 |
+| `reply` | 模型正文 | 长单位必有摘要 |
+
+不占编号的：`system` / `developer` 框架内容、程序注入的一次性产物
+（`<system-reminder>`、时间戳、生成标题的请求、提炼指令本身）。
+
+**工具单位内部形态**：
+
+```
+#5 <summary>确认 ttl 配置为 300 秒</summary>
+<content>
+<tool-call name="bash">{"command":"grep ttl config"}</tool-call>
+<tool-result isError="false">ttl=300</tool-result>
+</content>
+```
+
+一次工具调用和它的结果按 `callId` 关联，合成同一个编号。
+
+### 两层保真
+
+| 层 | 内容 | 何时 | 谁生成 |
+| --- | --- | --- | --- |
+| **L0** | 完整原文 | 永远在库里 | 原始记录 |
+| **L1** | 摘要 | 长单位（≥4000 字符）产生后串行 | 正在运行的模型 |
+
+折叠摘要（L2）必须从 L0 生成，**绝不从 L1 再摘要**——递归摘要会系统性语义衰减。
+
+### 发送投影
+
+模型看到什么，由投影决定（纯函数，不改库）：
+
+```
+近程（最新 32 个单位内）
+  #0 帮我修登录超时                          ← user，永不衰减
+  #1 <summary>排查方向：ttl 提前失效</summary>
+     <content>先看 token 过期逻辑…</content>   ← 有摘要，全发
+  #3 把 ttl 改成 600                          ← 无摘要，原样发
+
+远程（更早）
+  #1 <summary>排查方向：ttl 提前失效</summary>  ← 只发摘要
+  #3 把 ttl 改成 600                          ← 无摘要，原样保留
+```
+
+窗口按**单位数量**算（默认 32），不看 token。
+
+---
+
+## 安装
+
+### 在 WSL 里
 
 ```bash
-pnpm install && pnpm build
-
-# 全量索引（对真实 ~/.dsh/sessions，只读原文件；索引写入 ./data）
-node dist/cli.js index --all
-
-# 关键词搜索
-node dist/cli.js search "待办"
-node dist/cli.js search "时间戳" --limit 10
-node dist/cli.js search "待办 OR 时间戳" --order time
-
-# hybrid（需先配置 embedding 环境变量，否则自动退化为关键词）
-MEMORY_EMBEDDING_API_KEY=... MEMORY_EMBEDDING_BASE_URL=... MEMORY_EMBEDDING_MODEL=... \
-  node dist/cli.js search "那个日期问题" --mode hybrid
-
-# 状态
-node dist/cli.js status
-
-# HTTP 只读 API（默认 127.0.0.1:7800）
-node dist/cli.js serve
-# GET /status  GET /search?q=&mode=  GET /records?sessionId=&shadowed=  GET /reasoning?sessionId=  POST /index
+bash scripts-wsl/install-memory-plugin.sh
+bash scripts-wsl/launch-web.sh 8085
 ```
 
-指定目录：`--sessions <dir>`（默认 `~/.dsh/sessions`）、`--data <dir>`（默认 `./data`）。
+脚本会：同步源码 → 装依赖 → 构建 → 清旧库 → 挂到 web profile → 启动并打印带 token 的 URL。
 
-## 架构
+**登录由你自己完成**，脚本不碰凭据。
 
-```
-sessions/**/session.v4.jsonl.zstd   （只读）
-        │  ingest/log-reader.ts     逐帧解压（magic 0xFD2FB528，坏帧/残帧跳过）
-        ▼
-   ingest/extractor.ts              事件 → MemoryRecord / ReasoningRecord / shadowedSeqs
-        │                           （决策①③的落实点）
-        ▼
-   ingest/indexer.ts                写库 + FTS + 向量双通道
-        ▼
-   store/sqlite.ts  ← schema.sql（唯一权威建表）
-        │
-        ├── search/keyword.ts       FTS5 关键词（segment.ts 补中文分词局限）
-        ├── search/vector.ts        注入式向量（Noop / OpenAI 兼容）
-        └── search/merge.ts         RRF k=60 双路合并
-                │
-                ├── cli.ts           index / search / status / serve
-                └── api/server.ts    HTTP 只读 API
+### 手动
+
+```bash
+cd memory-plugin
+npm install && npm run build
+
+dsh plugin --profile web add "link:$(pwd)"
 ```
 
-## 安全边界
+启动后插件自动激活，无需额外配置。
 
-- 只读 `sessions/**/session.v4.jsonl.zstd`；不打开凭据、vault 等任何其他 `~/.dsh` 文件。
-- 原文件绝不修改；索引数据只写 `--data` 目录（已 gitignore）。
-- embedding key 只从环境变量读；HTTP API 无鉴权 = 只监听 127.0.0.1。
+---
+
+## 配置
+
+全部走环境变量：
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `MEMORY_DATA_DIR` | `./data` | 数据库目录 |
+| `MEMORY_WINDOW` | `32` | 近程窗口（单位数量） |
+| `MEMORY_SUMMARY_THRESHOLD` | `4000` | 长单位阈值（字符数） |
+| `MEMORY_AUTO_SUMMARY` | 开 | 设为 `0` 关闭自动总结 |
+| `MEMORY_MAX_RESULTS` | `8` | 检索默认返回条数 |
+
+---
+
+## 模型可用的工具
+
+### `memory_search`
+
+关键词检索，命中返回**完整原文**（不摘要、不截断），包含已老化、已折叠的内容。
+
+```
+memory_search("ttl 配置")
+→ [{ idx: 5, kind: "tool", summary: "确认 ttl=300", content: "<完整原文>" }]
+```
+
+### `memory_expand`
+
+展开折叠体，**严格分两级**：
+
+```
+memory_expand(from=4, to=9)   → 第一级：区间内各单位的摘要
+memory_expand(idx=7)          → 第二级：#7 的完整原文
+```
+
+不能一步跳到原文——强制先看概览、再决定深入哪里。
+
+### `memory_todo`
+
+待办台账。**用户只记得「有事没做」但想不起是什么**时，`list` 无需关键词直接返回全部未完成项。
+
+```
+list            → 所有 open 待办
+add             → 登记新待办
+done / drop     → 完成 / 放弃（记原因）
+```
+
+### `memory_override`
+
+用户后来推翻自己先前的判断，或承认模型的结论才对时，覆写某单位的摘要。
+
+**只改摘要，原文不动**，并保留完整的覆写记录（旧摘要、原因、谁推翻的）。发送视图会标 `[已覆写]`。
+
+### `memory_plan`
+
+规划：怎么干（架构、顺序、依赖）。**不是待办**——
+
+- **goal** = 什么算成功
+- **规划** = 怎么干，可覆写、可重建、可削弱
+- **待办** = 现在不做、留到以后
+
+关键规则：
+
+- 准入**只问时间**：「这件事要多久？」≥5 分钟建规划，不问「要不要规划」、不问步数
+- **每个版本强制命名**（1–60 字符），拒绝「更新」「修改」「v1」这类无信息量的名字
+- **已完成步骤绝不作废**：更新时漏掉的已完成步骤会自动补回
+- **追加任务削弱前、增强后**：已完成权重归零，未完成降到 0.3，新步骤 1.0
+- **回滚产生新版本**，旧版本全部保留，版本号只增不减
+
+---
+
+## CLI
+
+```bash
+memory-plugin units     --session <id>           列出编号单位
+memory-plugin unit      --session <id> --idx N   取某单位全文
+memory-plugin view      --session <id>           查看发送视图
+memory-plugin search    "query"                  检索
+memory-plugin fold      --session <id> --list    列出折叠
+memory-plugin todo      --session <id>           待办台账
+memory-plugin override  --session <id>           覆写记录
+memory-plugin plan      --session <id>           规划与版本历史
+memory-plugin compact   --session <id>           手动折叠（试运行加 --dry-run）
+memory-plugin status                             库状态
+```
+
+---
+
+## 数据
+
+单个 SQLite 文件（默认 `data/memory.sqlite`）：
+
+| 表 | 作用 |
+| --- | --- |
+| `message` | 编号单位（`idx` 唯一，`content` 永不删） |
+| `message_fts` | 关键词索引（思考的原文不入 FTS，避免命中过多） |
+| `message_vector` | 向量 |
+| `fold` | 折叠体 |
+| `todo` | 待办台账 |
+| `override_log` | 覆写记录 |
+| `plan` / `plan_version` | 规划快照 / 版本历史 |
+| `pending_summary` | 待总结状态 |
+| `summary_reply_fp` | 提炼回复指纹（避免一次性产物入库） |
+
+---
+
+## 设计约束
+
+这些是踩过坑之后定下来的，改代码时别破坏：
+
+**1. 原文永不删、永不改**
+
+`message.content` 是审计与防漂移的锚点。覆写只改 `summary`，折叠只标记 `folded_into`。
+
+**2. 编号永不改变、永不复用**
+
+总结后不变、老化后不变、折叠后不变。会话内连续无空洞。
+
+**3. 摘要必须校验**
+
+收割模型回复时有**三道校验**（`src/summary/validate.ts`）：
+
+- 过程性开场（「我先查一下…」「Let me check…」）→ 这是在干活，拒收
+- 长度 > 原文 60% → 未收敛，拒收
+- 与原文实词重合 < 15% → 串位，拒收
+
+实测教训：不加校验时 86 条摘要里 85 条是错的——串位、或把原话重复一遍。
+拒收时**保留 pending**，等下一轮。
+
+**4. 没有程序化触发索引**
+
+索引进库只发生在请求路径上（`llm/stream` 拿到实际发送的消息时）。
+没有定时器、没有轮末批量、没有 `agent/disposed` 钩子。
+
+**5. 投影只能走 surface**
+
+`llm/stream` 的消息被 `deepFreeze`，`pre-step` 只含本步批次，`snapshotEvents` 已废弃。
+唯一能改变模型所见历史的通道是 `session.append` + `surfaceOp: replace`（dsh 自家压缩同款）。
+读数用未废弃的 `eventAt(seq)`。
+
+**6. dsh 自带压缩不挂载**
+
+上下文大小完全由本模块的投影控制。
+
+---
+
+## 已知未验证
+
+**投影是否真的改变了模型所见**——代码路径接通、加载无错、纯函数逻辑有测试，
+但**没有在真实模型对话里实证过**（需要凭据）。
+
+如果消息前没有 `#N` 编号，就是投影没生效，检查 `/tmp/dsh-web-<port>.log`。
+
+---
 
 ## 开发
 
 ```bash
-pnpm test      # vitest + 覆盖率（store/extractor/search ≥80%）
-pnpm build     # tsc → dist/
-pnpm typecheck
+npm test              # 193 项测试
+npm run build         # 编译
+npx tsc --noEmit      # 类型检查
 ```
+
+诊断脚本在 [`scripts-wsl/`](../scripts-wsl/)：
+
+| 脚本 | 作用 |
+| --- | --- |
+| `install-memory-plugin.sh` | 安装到 WSL |
+| `verify-install.sh` | 验证安装完整性 |
+| `inspect-db.sh` | 查看数据库内容 |
+| `assess-session.sh` | 评估单会话质量（污染率、摘要覆盖率） |
+| `audit-mismatch.sh` | 核查摘要串位 |
+| `replay-validation.sh` | 用历史数据回放校验逻辑 |
+
+完整设计见 [`docs/A7-memory-design-final.md`](../docs/A7-memory-design-final.md)。
