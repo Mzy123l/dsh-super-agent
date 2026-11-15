@@ -1,40 +1,30 @@
 // dsh 适配层：把记忆插件挂到 DSH 上。
 //
-// ===========================================================================
-// 职责
-// ===========================================================================
+// 职责（见 docs/A7-memory-design-final.md）：
+// 1. 同步单位：从 llm/stream 拿实际发送消息 → 提取单位 → 线性编号入库
+// 2. 总结：pre-step 检测长单位 → 注入英文提炼指令 → 收割模型回复 → 挂接 summary
+// 3. 发送投影：近程 summary+content，远程只发 summary（不改库）
+// 4. 检索：memory_search 返回单位全量
 //
-// 1. **同步上下文**：每次模型请求前，把实际传给模型的消息按会话线性编号入库
-//    （idx 从 0 开始，0 = 第一个 user prompt）
-// 2. **标注索引**：给每条消息加上 `#N` 标签，随上下文一起传给模型
-// 3. **提炼循环**：pre-step 里注入提炼提示 / 收割提炼结果
-// 4. **检索工具**：模型按关键词查，命中返回该条全量
-//
-// ===========================================================================
-// 不做的事
-// ===========================================================================
-//
-// - 不做自动索引（用户要求「不要程序化触发索引」）
-// - 不让模型操作便签（便签由程序内部维护，只做展示）
-// - 不用 (sessionId, seq, kind) 三元组（索引按会话线性维护）
+// 不做：自动索引触发、总结类工具、压缩（后续单独设计）、dsh 自带压缩。
 
 import type { Context } from '@deepseek-ai/cordis'
 import { createUserMessage, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { MemoryStore } from './store/sqlite.js'
-import { SegmentStore, composeSlottedText } from './seal/types.js'
-import { PendingStore } from './loop/store.js'
-import { runLoopStep, archiveDue, computeSpans, type LoopHost } from './loop/engine.js'
-import { syncContext, labelInPlace, type ContextMessage } from './ingest/context-sync.js'
+import { PendingStore } from './summary/pending.js'
+import { runSummaryStep, SUMMARY_THRESHOLD, type SummaryHost } from './summary/flow.js'
+import { extractUnits } from './ingest/units.js'
+import { renderUnits, DEFAULT_WINDOW, type RenderOptions } from './projection/render.js'
 import { search } from './search/index.js'
 import { SqliteVectorStore, HashingEmbedding } from './search/vector.js'
 import { vectorId } from './search/index.js'
+import type { ContextMessage, Unit } from './types.js'
 
 /** 声明自定义消息来源。 */
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
-    'memory-loop-prompt': { kind: 'memory-loop-prompt' }
-    'memory-slot': { kind: 'memory-slot' }
+    'memory-summary-prompt': { kind: 'memory-summary-prompt' }
   }
 }
 
@@ -44,32 +34,18 @@ export const name = 'memory-plugin'
 /** 依赖的服务。 */
 export const inject = ['tools']
 
-/**
- * 释放资源：关闭数据库连接。
- *
- * dsh 的关停流程会 dispose 插件 fiber， cordis 会等待 disposer 完成。
- * `ctx.effect` 在 apply 内注册，这里同时提供显式 dispose 兜底。
- */
-export function dispose(ctx: Context): void {
-  try {
-    const memory = (ctx as unknown as { memory?: { store?: MemoryStore } }).memory
-    memory?.store?.close()
-  } catch {
-    // 关闭失败不影响进程退出
-  }
-}
-
 const DEFAULT_MAX_RESULTS = 8
-const DEFAULT_KEEP_RECENT = 20
 
-/** 配置（环境变量）。 */
+/** 配置。 */
 export interface Config {
   dataDir: string
   maxResults: number
-  /** 「近几步」保留原文的消息条数 */
-  keepRecent: number
-  /** 是否启用自动提炼 */
-  autoSummarize: boolean
+  /** 近程窗口（单位数量，完全不用 token） */
+  window: number
+  /** 长单位阈值（字符数） */
+  threshold: number
+  /** 是否启用自动总结 */
+  autoSummary: boolean
 }
 
 function resolveConfig(): Config {
@@ -80,8 +56,18 @@ function resolveConfig(): Config {
   return {
     dataDir: process.env.MEMORY_DATA_DIR ?? './data',
     maxResults: num(process.env.MEMORY_MAX_RESULTS, DEFAULT_MAX_RESULTS),
-    keepRecent: num(process.env.MEMORY_KEEP_RECENT, DEFAULT_KEEP_RECENT),
-    autoSummarize: process.env.MEMORY_AUTO_SUMMARIZE !== '0',
+    window: num(process.env.MEMORY_WINDOW, DEFAULT_WINDOW),
+    threshold: num(process.env.MEMORY_SUMMARY_THRESHOLD, SUMMARY_THRESHOLD),
+    autoSummary: process.env.MEMORY_AUTO_SUMMARY !== '0',
+  }
+}
+
+/** 释放资源。 */
+export function dispose(ctx: Context): void {
+  try {
+    ((ctx as unknown as { memory?: { store?: MemoryStore } }).memory)?.store?.close()
+  } catch {
+    // 关闭失败不影响退出
   }
 }
 
@@ -91,84 +77,22 @@ function resolveConfig(): Config {
 export function apply(ctx: Context): void {
   const config = resolveConfig()
   const store = new MemoryStore({ path: `${config.dataDir}/memory.sqlite` })
-  const segments = new SegmentStore(store.raw)
   const pending = new PendingStore(store.raw)
   const vectorStore = new SqliteVectorStore(store.raw)
   const embedding = new HashingEmbedding()
 
-  /** 各会话最近一条 assistant 输出（供收割）。 */
+  /** 各会话最近一条 assistant 可见文本与时刻（供收割）。 */
   const lastAssistant = new Map<string, { text: string; at: string }>()
 
-  /** 各会话的当前上下文（最近一次看到的完整消息列表）。 */
+  /** 各会话最近一次看到的完整上下文（llm/stream 捕获）。 */
   const currentContext = new Map<string, ContextMessage[]>()
 
-  // -------------------------------------------------------------------------
-  // 提炼循环：pre-step
-  // -------------------------------------------------------------------------
-  ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
-    try {
-      const sessionId = (agent.session as { id?: string }).id
-      if (typeof sessionId === 'string' && sessionId.length > 0) {
-        // 1) 同步当前上下文 → 分配线性索引（idx 0 = 第一个 user prompt）
-        const context = currentContext.get(sessionId) ?? []
-        if (context.length > 0) {
-          syncContext(store, sessionId, context, new Date().toISOString())
-        }
-        // 2) 给消息加 `#N` 标记（索引作为 token 传给模型）。
-        //    必须在 next() 之前：此刻消息尚未冻结，改写会随请求一起发出。
-        labelInPlace(messages, store, sessionId)
-      }
-    } catch (error) {
-      ctx.logger.warn('memory-plugin: label failed: %s', String(error))
-    }
-
-    const decision = await next()
-    signal.throwIfAborted()
-
-    try {
-      const sessionId = (agent.session as { id?: string }).id
-      if (typeof sessionId !== 'string' || sessionId.length === 0) return decision
-
-      // 3) 循环决策
-      const host: LoopHost = {
-        store,
-        segments,
-        pending,
-        apply: (segmentNo) => applySegment(ctx, sessionId, segmentNo, store, segments),
-        keepRecent: config.keepRecent,
-        autoSummarize: config.autoSummarize,
-        warn: (m) => ctx.logger.warn('memory-plugin: %s', m),
-      }
-
-      const action = runLoopStep(sessionId, host, lastAssistant.get(sessionId))
-
-      // 4) 注入提炼提示
-      if (action.kind === 'injected' && decision.kind !== 'reject') {
-        const prompt = createUserMessage({
-          content: [{ type: 'text', text: action.promptText }],
-          source: { kind: 'memory-loop-prompt' },
-        })
-        const at = decision.messages.findLastIndex(m => messages.includes(m))
-        return { ...decision, messages: decision.messages.toSpliced(at + 1, 0, prompt) }
-      }
-
-      // 5) 顺带做窗口滑动
-      const range = store.indexRange(sessionId)
-      if (range) archiveDue(segments, sessionId, config.keepRecent, range.max)
-
-      return decision
-    } catch (error) {
-      ctx.logger.warn('memory-plugin: loop failed: %s', String(error))
-      return decision
-    }
-  }, { global: true, prepend: true })
+  /** 该会话最近产出的单位（用于注入指令时引用编号）。 */
+  const lastUnits = new Map<string, number[]>()
 
   // -------------------------------------------------------------------------
-  // 观察上下文与 assistant 输出
+  // 观察：llm/stream 拿到实际发送消息 → 提取单位 → 入库编号
   // -------------------------------------------------------------------------
-  // `llm/stream` 是唯一能拿到「本次真正发给模型的完整消息」的接缝。
-  // 用它维护 currentContext，并在 pre-step 时同步入库。
-  // 类型：waterfall 的返回值必须是 next() 的结果（AsyncIterable），原样透传。
   type StreamNext = () => AsyncIterable<StreamChunk>
   ctx.on('llm/stream', (options: { sessionId?: string; messages?: ContextMessage[] }, next: StreamNext) => {
     try {
@@ -176,14 +100,17 @@ export function apply(ctx: Context): void {
       const msgs = options.messages
       if (typeof sid === 'string' && Array.isArray(msgs)) {
         currentContext.set(sid, msgs)
-        syncContext(store, sid, msgs, new Date().toISOString())
+        syncUnits(store, sid, msgs, lastUnits, (t) => pending.isConsumedReply(sid, t))
       }
-    } catch {
-      // 采集失败不能影响请求
+    } catch (error) {
+      ctx.logger.warn('memory-plugin: sync failed: %s', String(error))
     }
     return next()
   }, { global: true })
 
+  // -------------------------------------------------------------------------
+  // 观察：assistant 输出（供总结收割）
+  // -------------------------------------------------------------------------
   ctx.on('session/event', (session, event) => {
     const sid = (session as unknown as { id?: string }).id
     if (typeof sid !== 'string') return
@@ -193,17 +120,58 @@ export function apply(ctx: Context): void {
       data?: { message?: { content?: Array<{ type?: string; text?: string }> } }
     }
     if (ev.type !== 'assistant/message') return
-    const blocks = ev.data?.message?.content
-    if (!Array.isArray(blocks)) return
-    const text = blocks
+    const content = ev.data?.message?.content
+    if (!Array.isArray(content)) return
+    const text = content
       .filter(b => b?.type === 'text' && typeof b.text === 'string')
       .map(b => b.text as string)
       .join('\n')
       .trim()
-    if (text.length > 0) {
-      lastAssistant.set(sid, { text, at: new Date(ev.time ?? Date.now()).toISOString() })
-    }
+    if (text.length === 0) return
+    lastAssistant.set(sid, { text, at: new Date(ev.time ?? Date.now()).toISOString() })
   }, { global: true })
+
+  // -------------------------------------------------------------------------
+  // 总结流程 + 发送投影：pre-step
+  // -------------------------------------------------------------------------
+  ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
+    const decision = await next()
+    signal.throwIfAborted()
+
+    try {
+      const sessionId = (agent.session as { id?: string }).id
+      if (typeof sessionId !== 'string' || sessionId.length === 0) return decision
+      if (decision.kind === 'reject') return decision
+
+      // 1) 总结流程：先收割上一轮回复，再决定是否注入新指令
+      if (config.autoSummary) {
+        const host: SummaryHost = {
+          store,
+          pending,
+          lastAssistantText: (sid) => lastAssistant.get(sid)?.text,
+          lastAssistantAt: (sid) => lastAssistant.get(sid)?.at,
+          threshold: config.threshold,
+          warn: (m) => ctx.logger.warn('memory-plugin: %s', m),
+        }
+        const action = runSummaryStep(sessionId, host)
+
+        if (action.kind === 'inject') {
+          // 注入英文提炼指令（只出现一次）
+          const prompt = createUserMessage({
+            content: [{ type: 'text', text: action.promptText }],
+            source: { kind: 'memory-summary-prompt' },
+          })
+          const at = decision.messages.findLastIndex(m => messages.includes(m))
+          return { ...decision, messages: decision.messages.toSpliced(at + 1, 0, prompt) }
+        }
+      }
+
+      return decision
+    } catch (error) {
+      ctx.logger.warn('memory-plugin: pre-step failed: %s', String(error))
+      return decision
+    }
+  }, { global: true, prepend: true })
 
   // -------------------------------------------------------------------------
   // 检索工具
@@ -211,9 +179,10 @@ export function apply(ctx: Context): void {
   ctx.tools.register(defineTool({
     name: 'memory_search',
     description:
-      'Search this conversation\'s messages by keyword. Each message has an index like #0, #1 written in front of it '
-      + 'in the context. Call this to retrieve the FULL text of a message you saw earlier, including messages that were '
-      + 'compacted out of the current context. Returns the complete message text, never a summary.',
+      'Search this conversation by keyword and get the FULL text of the matching units back. '
+      + 'Each unit in your context is labelled #0, #1, #2 and so on. Older units are shown only as their '
+      + 'summary; call this to read the complete original content of any unit, including units that are '
+      + 'no longer in the context. Returns complete text, never a truncated version.',
     parameters: {
       query: { type: 'string', description: 'Text to search for. Keywords work best.' },
       limit: { type: 'number', description: 'Maximum results (default 8).' },
@@ -231,13 +200,12 @@ export function apply(ctx: Context): void {
               type: 'object',
               additionalProperties: false,
               properties: {
-                sessionId: { type: 'string' },
                 idx: { type: 'number' },
-                role: { type: 'string' },
+                kind: { type: 'string' },
+                summary: { type: 'string' },
+                content: { type: 'string' },
                 inContext: { type: 'boolean' },
                 tags: { type: 'array', items: { type: 'string' } },
-                text: { type: 'string' },
-                score: { type: 'number' },
               },
             },
           },
@@ -253,7 +221,17 @@ export function apply(ctx: Context): void {
         String(args.query ?? ''),
         { limit: typeof args.limit === 'number' ? args.limit : config.maxResults, sessionId },
       )
-      return { results: hits, total: hits.length }
+      return {
+        results: hits.map(h => ({
+          idx: h.idx,
+          kind: h.kind,
+          summary: h.summary,
+          content: h.content,
+          inContext: h.inContext,
+          tags: h.tags,
+        })),
+        total: hits.length,
+      }
     },
     presentCall: (args: unknown) => ({ card: 'generic', title: 'memory_search', rawInput: args }),
   }))
@@ -262,17 +240,25 @@ export function apply(ctx: Context): void {
   // 只读观测面
   // -------------------------------------------------------------------------
   ctx.provide('memory', {
-    /** 手动索引当前上下文（不做自动触发）。 */
+    /** 手动同步某会话的当前上下文（无自动触发）。 */
     sync: (sessionId: string) => {
       const msgs = currentContext.get(sessionId)
-      return msgs ? syncContext(store, sessionId, msgs, new Date().toISOString()) : undefined
+      return msgs ? syncUnits(store, sessionId, msgs, lastUnits, (t) => pending.isConsumedReply(sessionId, t)) : undefined
     },
-    /** 某会话的索引范围。 */
+    /** 某会话的编号范围。 */
     range: (sessionId: string) => store.indexRange(sessionId),
-    /** 可提炼的区间。 */
-    spans: (sessionId: string) => computeSpans(store, segments, sessionId),
+    /** 渲染某会话的发送视图（诊断）。 */
+    render: (sessionId: string, opts: RenderOptions = {}) => {
+      const range = store.indexRange(sessionId)
+      if (!range) return []
+      return renderUnits(store.listRange(sessionId, range.min, range.max), {
+        window: opts.window ?? config.window,
+        latestIdx: range.max,
+      })
+    },
+    /** 最近产出的单位编号。 */
+    lastUnits: (sessionId: string) => lastUnits.get(sessionId) ?? [],
     store,
-    segments,
     vectors: vectorStore,
   })
 
@@ -280,49 +266,46 @@ export function apply(ctx: Context): void {
 }
 
 /**
- * 把一段应用到会话：遮蔽原区间，写入合并消息。
+ * 同步单位到库：提取 → 追加（幂等复用编号）。
  *
- * 技术要点（实测得出）：
- * - dsh 要求 `sourceEventSeqs` 完整列出每个被遮蔽节点，缺一个就拒绝
- * - 该列表不允许重复，必须去重
- * - 拿不到会话或节点时抛错，不做空替换
+ * @returns 本次的单位编号列表。
  */
-function applySegment(
-  ctx: Context,
-  sessionId: string,
-  segmentNo: number,
+export function syncUnits(
   store: MemoryStore,
-  segments: SegmentStore,
-): void {
-  const seg = segments.get(segmentNo)
-  if (!seg) throw new Error(`segment ${segmentNo} not found`)
+  sessionId: string,
+  messages: readonly ContextMessage[],
+  cache?: Map<string, number[]>,
+  isConsumedReply?: (text: string) => boolean,
+): number[] {
+  const at = new Date().toISOString()
+  const units = extractUnits(messages, at, sessionId, isConsumedReply)
+  const idxs: number[] = []
 
-  const sessions = (ctx as unknown as { sessions?: { get?: (id: string) => SessionLike | undefined } }).sessions
-  const session = sessions?.get?.(sessionId)
-  if (!session || typeof session.append !== 'function') {
-    throw new Error(`session ${sessionId} is not reachable`)
+  for (const unit of units) {
+    const idx = store.appendUnit(unit)
+    idxs.push(idx)
   }
 
-  // 找出这段 idx 对应的真实 seq
-  const rows = store.raw
-    .prepare(`SELECT idx, text FROM message WHERE sessionId = ? AND idx >= ? AND idx <= ? ORDER BY idx ASC`)
-    .all(sessionId, seg.fromIdx, seg.toIdx) as Array<{ idx: number; text: string }>
-  if (rows.length === 0) throw new Error(`no messages in idx ${seg.fromIdx}–${seg.toIdx}`)
+  // 本次没出现的编号 → 标记已离开上下文（编号保留）
+  if (idxs.length > 0) {
+    const maxIdx = Math.max(...idxs)
+    const present = new Set(idxs)
+    for (let i = 0; i <= maxIdx; i += 1) {
+      if (!present.has(i)) store.markOutOfContext(sessionId, i)
+    }
+  }
 
-  // 合并消息：live 保留原文，archived 只有总结
-  const body = composeSlottedText([
-    { kind: 'recent', text: seg.recent },
-    { kind: 'summary', text: seg.summary },
-  ])
-
-  // 标记这些 idx 已离开上下文（编号保留，仍可检索）
-  store.markOutOfContext(sessionId, seg.fromIdx, seg.toIdx)
-
-  // 给段覆盖的每条消息加便签（程序内部维护，只做展示）
-  for (const row of rows) store.addTag(sessionId, row.idx, '已提炼')
+  cache?.set(sessionId, idxs)
+  store.setMeta('lastIndexedAt', at)
+  return idxs
 }
 
-/** 会话的最小形状。 */
-interface SessionLike {
-  append?: (type: string, data: unknown, opts?: unknown) => unknown
+/** 供外部使用：渲染某会话的发送文本。 */
+export function renderSession(store: MemoryStore, sessionId: string, window: number): string[] {
+  const range = store.indexRange(sessionId)
+  if (!range) return []
+  const units = store.listRange(sessionId, range.min, range.max) as Unit[]
+  return renderUnits(units, { window, latestIdx: range.max })
 }
+
+export { vectorId }

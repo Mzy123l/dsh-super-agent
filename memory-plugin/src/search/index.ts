@@ -1,14 +1,11 @@
-// 检索：模型按关键词查，命中后返回该条消息的**全量**。
+// 检索：命中返回单位的**全量**（不摘要、不截断）。
 //
-// 用户要求：「模型要查找，就返回这一条的全量」——
-// 所以这里不做摘要、不截断正文。
-//
-// 便签（tags）是程序内部维护的，只随结果展示，模型不能按它检索。
+// 全量搜索：不管单位是否已老化（既定决策）。
+// 便签只读展示，模型不能按便签检索。
 
 import type { MemoryStore } from '../store/sqlite.js'
-import type { MessageResult, SearchMode, SearchOptions, VectorStore, EmbeddingProvider } from '../types.js'
+import type { EmbeddingProvider, SearchMode, SearchOptions, UnitKind, VectorStore } from '../types.js'
 import { buildFtsQuery } from './segment.js'
-import { segmentForFts } from './segment.js'
 
 /** 搜索上下文。 */
 export interface SearchContext {
@@ -19,32 +16,27 @@ export interface SearchContext {
 
 /** 一条检索结果。 */
 export interface SearchHit {
-  /** 会话 id */
   sessionId: string
-  /** 会话内索引：模型用它指代这条消息 */
+  /** 会话内编号，模型用它指代该单位 */
   idx: number
-  /** 角色 */
-  role: string
-  /** 是否仍在上下文里 */
-  inContext: boolean
-  /** 便签（程序内部维护，只读展示） */
-  tags: string[]
+  kind: UnitKind
+  /** 该单位的总结（空 = 未总结） */
+  summary: string
   /** **全量正文** */
-  text: string
-  /** 相关度分数 */
+  content: string
+  /** 是否仍在近程窗口内（粗判：in_context） */
+  inContext: boolean
+  tags: string[]
   score: number
 }
 
 /**
  * 执行检索。
  *
- * keyword 模式走 FTS；hybrid 模式加向量路，RRF 合并。
- * 命中后取该条消息的全量正文返回。
- *
  * @param ctx - 搜索上下文。
  * @param query - 查询文本。
- * @param options - 选项（模式、条数、限定会话）。
- * @returns 结果列表（按分数降序）。
+ * @param options - 模式、条数、会话。
+ * @returns 结果（按分数降序）。
  */
 export async function search(
   ctx: SearchContext,
@@ -58,19 +50,18 @@ export async function search(
 
   const hits = new Map<string, SearchHit>()
 
-  // ---- 关键词路 ----
+  // 关键词路
   const ftsQuery = buildFtsQuery(q)
   if (ftsQuery) {
     const rows = ctx.store.searchFts(ftsQuery, Math.max(limit * 3, 20), options.sessionId)
     rows.forEach((row, i) => {
-      const msg = ctx.store.getByRowId(row.rowId)
-      if (!msg) return
-      const key = `${msg.sessionId}#${msg.idx}`
-      hits.set(key, toHit(msg, 1 / (60 + i + 1)))
+      const unit = ctx.store.getByRowId(row.rowId)
+      if (!unit) return
+      hits.set(`${unit.sessionId}#${unit.idx}`, toHit(unit, 1 / (60 + i + 1)))
     })
   }
 
-  // ---- 向量路（仅在 hybrid 且真实现了向量时）----
+  // 向量路
   if (mode === 'hybrid' && ctx.vectorStore && ctx.embedding) {
     try {
       const emb = await ctx.embedding.embed(q)
@@ -78,33 +69,39 @@ export async function search(
       vecHits.forEach((vh, i) => {
         const parsed = parseVectorId(vh.id)
         if (!parsed) return
-        const msg = ctx.store.getMessage(parsed.sessionId, parsed.idx)
-        if (!msg) return
-        const key = `${msg.sessionId}#${msg.idx}`
+        const unit = ctx.store.getUnit(parsed.sessionId, parsed.idx)
+        if (!unit) return
+        const key = `${unit.sessionId}#${unit.idx}`
         const contribution = 1 / (60 + i + 1)
         const prev = hits.get(key)
         if (prev) prev.score += contribution
-        else hits.set(key, toHit(msg, contribution))
+        else hits.set(key, toHit(unit, contribution))
       })
     } catch {
       // 向量路故障不影响关键词结果
     }
   }
 
-  return [...hits.values()]
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit)
+  return [...hits.values()].sort((a, b) => b.score - a.score).slice(0, limit)
 }
 
-/** MessageResult → SearchHit（全量正文，不截断）。 */
-function toHit(msg: MessageResult, score: number): SearchHit {
+function toHit(u: {
+  sessionId: string
+  idx: number
+  kind: UnitKind
+  summary: string
+  content: string
+  inContext: boolean
+  tags: string[]
+}, score: number): SearchHit {
   return {
-    sessionId: msg.sessionId,
-    idx: msg.idx,
-    role: msg.role,
-    inContext: msg.inContext,
-    tags: msg.tags,
-    text: msg.text,
+    sessionId: u.sessionId,
+    idx: u.idx,
+    kind: u.kind,
+    summary: u.summary,
+    content: u.content,
+    inContext: u.inContext,
+    tags: u.tags,
     score,
   }
 }
@@ -122,5 +119,3 @@ export function parseVectorId(id: string): { sessionId: string; idx: number } | 
 export function vectorId(sessionId: string, idx: number): string {
   return `${sessionId}#${idx}`
 }
-
-export { segmentForFts }

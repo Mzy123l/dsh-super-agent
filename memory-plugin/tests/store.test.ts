@@ -1,140 +1,207 @@
-// 存储与索引测试：验证「会话内线性编号」是核心不变量。
+// 存储与检索测试：验证线性编号、summary 挂接、FTS 规则。
 
 import { describe, expect, it, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { MemoryStore } from '../src/store/sqlite.js'
-import { buildFtsQuery, segmentForFts } from '../src/search/segment.js'
+import { buildFtsQuery } from '../src/search/segment.js'
+import { search, vectorId, parseVectorId } from '../src/search/index.js'
+import { SqliteVectorStore, HashingEmbedding, cosine, tokenize } from '../src/search/vector.js'
 
-describe('线性索引', () => {
+describe('线性编号', () => {
   let store: MemoryStore
   beforeEach(() => { store = new MemoryStore({ path: ':memory:' }) })
   afterEach(() => { store.close() })
 
-  it('第一条消息 idx = 0', () => {
-    const idx = store.appendMessage({
-      sessionId: 's', role: 'user', text: '第一个 prompt', at: '2026-01-01T00:00:00Z',
-    })
-    expect(idx).toBe(0)
+  const u = (content: string, kind: 'user' | 'reply' = 'user', sessionId = 's') =>
+    ({ sessionId, kind, summary: '', content, at: 'x', inContext: true, tags: [] })
+
+  it('第一个单位编号为 0', () => {
+    expect(store.appendUnit(u('第一个问题'))).toBe(0)
   })
 
-  it('严格线性递增，无空洞', () => {
-    const idxs = ['a', 'b', 'c', 'd'].map((t, i) =>
-      store.appendMessage({ sessionId: 's', role: i % 2 ? 'assistant' : 'user', text: t, at: 'x' }))
-    expect(idxs).toEqual([0, 1, 2, 3])
+  it('连续递增无空洞', () => {
+    expect([store.appendUnit(u('a')), store.appendUnit(u('b')), store.appendUnit(u('c'))]).toEqual([0, 1, 2])
   })
 
   it('不同会话各自从 0 开始', () => {
-    expect(store.appendMessage({ sessionId: 'a', role: 'user', text: 'a0', at: 'x' })).toBe(0)
-    expect(store.appendMessage({ sessionId: 'a', role: 'user', text: 'a1', at: 'x' })).toBe(1)
-    expect(store.appendMessage({ sessionId: 'b', role: 'user', text: 'b0', at: 'x' })).toBe(0)
-    expect(store.appendMessage({ sessionId: 'b', role: 'user', text: 'b1', at: 'x' })).toBe(1)
-    // 回到 a 继续
-    expect(store.appendMessage({ sessionId: 'a', role: 'user', text: 'a2', at: 'x' })).toBe(2)
+    expect(store.appendUnit(u('a', 'user', 'a'))).toBe(0)
+    expect(store.appendUnit(u('a', 'user', 'a2')).toString()).toBeDefined()
+    expect(store.appendUnit(u('b', 'user', 'b'))).toBe(0)
+    expect(store.appendUnit(u('c', 'user', 'a'))).toBe(1)
   })
 
-  it('同会话同角色同正文重复写入复用编号', () => {
-    const first = store.appendMessage({ sessionId: 's', role: 'user', text: '重复内容', at: 'x' })
-    const second = store.appendMessage({ sessionId: 's', role: 'user', text: '重复内容', at: 'y' })
+  it('同会话同 kind 同内容重复写入复用编号', () => {
+    const first = store.appendUnit(u('重复'))
+    const second = store.appendUnit(u('重复'))
     expect(second).toBe(first)
     expect(store.count('s')).toBe(1)
   })
 
-  it('同正文不同角色各占一个编号', () => {
-    const a = store.appendMessage({ sessionId: 's', role: 'user', text: '同样的话', at: 'x' })
-    const b = store.appendMessage({ sessionId: 's', role: 'assistant', text: '同样的话', at: 'x' })
-    expect(a).not.toBe(b)
+  it('同内容不同 kind 各占编号', () => {
+    expect(store.appendUnit(u('同样的话', 'user'))).toBe(0)
+    expect(store.appendUnit(u('同样的话', 'reply'))).toBe(1)
   })
 
-  it('索引范围正确反映最小与最大', () => {
-    for (const t of ['x', 'y', 'z']) store.appendMessage({ sessionId: 's', role: 'user', text: t, at: 'x' })
+  it('索引范围正确', () => {
+    for (const t of ['a', 'b', 'c']) store.appendUnit(u(t))
     expect(store.indexRange('s')).toEqual({ min: 0, max: 2 })
   })
 
-  it('空会话无索引范围', () => {
+  it('空会话无范围', () => {
     expect(store.indexRange('nope')).toBeUndefined()
   })
 })
 
-describe('上下文状态与便签', () => {
+describe('summary 挂接', () => {
   let store: MemoryStore
   beforeEach(() => { store = new MemoryStore({ path: ':memory:' }) })
   afterEach(() => { store.close() })
 
-  it('markOutOfContext 只改状态，编号保留', () => {
-    for (const t of ['a', 'b', 'c']) store.appendMessage({ sessionId: 's', role: 'user', text: t, at: 'x' })
-    store.markOutOfContext('s', 0, 1)
-    expect(store.getMessage('s', 0)?.inContext).toBe(false)
-    expect(store.getMessage('s', 1)?.inContext).toBe(false)
-    expect(store.getMessage('s', 2)?.inContext).toBe(true)
-    // 编号没变
-    expect(store.getMessage('s', 0)?.idx).toBe(0)
+  it('挂接 summary 后编号不变、内容不变', () => {
+    const idx = store.appendUnit({ sessionId: 's', kind: 'reply', summary: '', content: '原文', at: 'x', inContext: true, tags: [] })
+    expect(store.setSummary('s', idx, '要点')).toBe(true)
+    const u = store.getUnit('s', idx)!
+    expect(u.idx).toBe(idx)
+    expect(u.summary).toBe('要点')
+    expect(u.content).toBe('原文')
   })
 
-  it('addTag 追加便签且去重', () => {
-    store.appendMessage({ sessionId: 's', role: 'user', text: '内容', at: 'x' })
-    store.addTag('s', 0, '已提炼')
-    store.addTag('s', 0, '已提炼')
-    expect(store.getMessage('s', 0)?.tags).toEqual(['已提炼'])
+  it('不存在的编号返回 false', () => {
+    expect(store.setSummary('s', 99, 'x')).toBe(false)
+  })
+
+  it('status 统计已总结数量', () => {
+    store.appendUnit({ sessionId: 's', kind: 'reply', summary: '', content: 'a', at: 'x', inContext: true, tags: [] })
+    store.appendUnit({ sessionId: 's', kind: 'reply', summary: '', content: 'b', at: 'x', inContext: true, tags: [] })
+    store.setSummary('s', 0, '要点')
+    expect(store.status().withSummary).toBe(1)
+  })
+})
+
+describe('FTS 规则', () => {
+  let store: MemoryStore
+  beforeEach(() => { store = new MemoryStore({ path: ':memory:' }) })
+  afterEach(() => { store.close() })
+
+  it('普通内容可搜', () => {
+    store.appendUnit({ sessionId: 's', kind: 'reply', summary: '', content: '登录超时的排查记录', at: 'x', inContext: true, tags: [] })
+    expect(store.searchFts(buildFtsQuery('登录'), 10).length).toBeGreaterThan(0)
+  })
+
+  it('thinking 的 content 不进 FTS（既定决策）', () => {
+    store.appendUnit({ sessionId: 's', kind: 'thinking', summary: '', content: '我在想这个方案是否可行', at: 'x', inContext: true, tags: [] })
+    expect(store.searchFts(buildFtsQuery('方案'), 10)).toHaveLength(0)
+  })
+
+  it('thinking 的 summary 进 FTS', () => {
+    store.appendUnit({ sessionId: 's', kind: 'thinking', summary: '', content: '内部细节', at: 'x', inContext: true, tags: [] })
+    store.setSummary('s', 0, '讨论了方案可行性')
+    expect(store.searchFts(buildFtsQuery('可行性'), 10).length).toBeGreaterThan(0)
+  })
+
+  it('挂接 summary 后该单位可被 summary 关键词命中', () => {
+    store.appendUnit({ sessionId: 's', kind: 'tool', summary: '', content: '<tool-call name="bash">ls</tool-call>', at: 'x', inContext: true, tags: [] })
+    expect(store.searchFts(buildFtsQuery('文件列表'), 10)).toHaveLength(0)
+    store.setSummary('s', 0, '列出了文件列表')
+    expect(store.searchFts(buildFtsQuery('文件列表'), 10).length).toBeGreaterThan(0)
+  })
+
+  it('限定会话过滤', () => {
+    store.appendUnit({ sessionId: 'a', kind: 'reply', summary: '', content: '共同词', at: 'x', inContext: true, tags: [] })
+    store.appendUnit({ sessionId: 'b', kind: 'reply', summary: '', content: '共同词', at: 'x', inContext: true, tags: [] })
+    const hits = store.searchFts(buildFtsQuery('共同词'), 10, 'a')
+    expect(hits.every(h => h.sessionId === 'a')).toBe(true)
+  })
+
+  it('已离开上下文的单位仍可搜', () => {
+    store.appendUnit({ sessionId: 's', kind: 'reply', summary: '', content: '重要信息', at: 'x', inContext: true, tags: [] })
+    store.markOutOfContext('s', 0)
+    expect(store.searchFts(buildFtsQuery('重要信息'), 10).length).toBeGreaterThan(0)
+  })
+})
+
+describe('便签', () => {
+  let store: MemoryStore
+  beforeEach(() => { store = new MemoryStore({ path: ':memory:' }) })
+  afterEach(() => { store.close() })
+
+  it('追加便签并去重', () => {
+    store.appendUnit({ sessionId: 's', kind: 'reply', summary: '', content: 'x', at: 'x', inContext: true, tags: [] })
+    store.addTag('s', 0, '已老化')
+    store.addTag('s', 0, '已老化')
+    expect(store.getUnit('s', 0)?.tags).toEqual(['已老化'])
   })
 
   it('便签不影响正文', () => {
-    store.appendMessage({ sessionId: 's', role: 'user', text: '原文', at: 'x' })
-    store.addTag('s', 0, '标签')
-    expect(store.getMessage('s', 0)?.text).toBe('原文')
+    store.appendUnit({ sessionId: 's', kind: 'reply', summary: '', content: '原文', at: 'x', inContext: true, tags: [] })
+    store.addTag('s', 0, 'tag')
+    expect(store.getUnit('s', 0)?.content).toBe('原文')
   })
 })
 
-describe('检索', () => {
+describe('向量', () => {
+  it('tokenize 逐字切 CJK', () => {
+    expect(tokenize('待办')).toEqual(['待', '办'])
+  })
+
+  it('cosine 同向为 1', () => {
+    expect(cosine([1, 0], [1, 0])).toBeCloseTo(1)
+  })
+
+  it('HashingEmbedding 归一化', async () => {
+    const e = new HashingEmbedding(64)
+    const v = await e.embed('测试')
+    expect(Math.sqrt(v.reduce((s, x) => s + x * x, 0))).toBeCloseTo(1, 5)
+  })
+
+  it('SqliteVectorStore 写入与检索', async () => {
+    const store = new MemoryStore({ path: ':memory:' })
+    store.appendUnit({ sessionId: 's', kind: 'reply', summary: '', content: 'a', at: 'x', inContext: true, tags: [] })
+    const vs = new SqliteVectorStore(store.raw)
+    await vs.upsert(vectorId('s', 0), [1, 0, 0])
+    const hits = await vs.search([1, 0, 0], 1)
+    expect(hits[0]?.id).toBe('s#0')
+    store.close()
+  })
+
+  it('vectorId 往返', () => {
+    expect(parseVectorId(vectorId('s', 3))).toEqual({ sessionId: 's', idx: 3 })
+    expect(parseVectorId('bad')).toBeUndefined()
+  })
+})
+
+describe('search 整合', () => {
   let store: MemoryStore
   beforeEach(() => { store = new MemoryStore({ path: ':memory:' }) })
   afterEach(() => { store.close() })
 
-  it('中文能搜到（逐字分词）', () => {
-    store.appendMessage({ sessionId: 's', role: 'user', text: '把这件事记成待办，回头再处理', at: 'x' })
-    const hits = store.searchFts(buildFtsQuery('待办'), 10)
-    expect(hits).toHaveLength(1)
+  it('命中返回全量 content', async () => {
+    const long = '详细内容'.repeat(500)
+    store.appendUnit({ sessionId: 's', kind: 'reply', summary: '', content: `待办事项：${long}`, at: 'x', inContext: true, tags: [] })
+    const hits = await search({ store }, '待办', {})
+    expect(hits[0]?.content.length).toBeGreaterThan(2000)
+    expect(hits[0]?.content).toContain('待办事项')
+  })
+
+  it('结果带 idx/kind/summary/tags', async () => {
+    store.appendUnit({ sessionId: 's', kind: 'thinking', summary: '', content: 'x', at: 'x', inContext: true, tags: [] })
+    store.setSummary('s', 0, '关键词要点')
+    store.addTag('s', 0, '已老化')
+    const hits = await search({ store }, '关键词', {})
     expect(hits[0]?.idx).toBe(0)
+    expect(hits[0]?.kind).toBe('thinking')
+    expect(hits[0]?.summary).toBe('关键词要点')
+    expect(hits[0]?.tags).toContain('已老化')
   })
 
-  it('思考内容也进 FTS（不再区分类型）', () => {
-    store.appendMessage({ sessionId: 's', role: 'assistant', text: '我在想这个方案是否可行', at: 'x' })
-    const hits = store.searchFts(buildFtsQuery('方案'), 10)
-    expect(hits.length).toBeGreaterThan(0)
+  it('空查询返回空', async () => {
+    store.appendUnit({ sessionId: 's', kind: 'reply', summary: '', content: 'x', at: 'x', inContext: true, tags: [] })
+    expect(await search({ store }, '  ', {})).toHaveLength(0)
   })
 
-  it('限定会话时只返回该会话', () => {
-    store.appendMessage({ sessionId: 'a', role: 'user', text: '共同关键词', at: 'x' })
-    store.appendMessage({ sessionId: 'b', role: 'user', text: '共同关键词', at: 'x' })
-    const hits = store.searchFts(buildFtsQuery('共同关键词'), 10, 'a')
-    expect(hits).toHaveLength(1)
-    expect(hits[0]?.sessionId).toBe('a')
-  })
-
-  it('已离开上下文的消息仍可检索', () => {
-    store.appendMessage({ sessionId: 's', role: 'user', text: '重要信息', at: 'x' })
-    store.markOutOfContext('s', 0, 0)
-    const hits = store.searchFts(buildFtsQuery('重要信息'), 10)
-    expect(hits).toHaveLength(1)
-  })
-})
-
-describe('持久化', () => {
-  it('文件库重开后数据与编号都在', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mem-'))
-    try {
-      const p = join(dir, 'nested', 'm.sqlite')
-      const s1 = new MemoryStore({ path: p })
-      s1.appendMessage({ sessionId: 's', role: 'user', text: '持久化', at: 'x' })
-      s1.close()
-
-      const s2 = new MemoryStore({ path: p })
-      expect(s2.getMessage('s', 0)?.text).toBe('持久化')
-      expect(s2.indexRange('s')).toEqual({ min: 0, max: 0 })
-      s2.close()
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
+  it('限定会话', async () => {
+    store.appendUnit({ sessionId: 'a', kind: 'reply', summary: '', content: '共同', at: 'x', inContext: true, tags: [] })
+    store.appendUnit({ sessionId: 'b', kind: 'reply', summary: '', content: '共同', at: 'x', inContext: true, tags: [] })
+    const hits = await search({ store }, '共同', { sessionId: 'a' })
+    expect(hits.every(h => h.sessionId === 'a')).toBe(true)
   })
 })

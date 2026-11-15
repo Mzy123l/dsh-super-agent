@@ -1,28 +1,21 @@
 // SQLite 存储层。
 //
-// 核心约定（见 schema.sql）：
-//   * 索引是给模型看的 token（`#0` `#1` …），标在消息里。
-//   * **一个会话内线性递增**，从 0 开始，不间断不跳号。
-//   * 不再用 (sessionId, seq, kind) 三元组——一条消息一个槽位一个编号。
-//   * 内部行号 row_id 只给 FTS 当 rowid 用，不对外暴露。
+// 编号规则（见 schema.sql）：
+//   * 会话内完全线性：0,1,2… 连续无空洞、不复用、不跳号。
+//   * #0 = 该会话第一个 user prompt。
+//   * 内部行号 row_id 只给 FTS 当 rowid，不对外。
 
 import DatabaseConstructor from 'better-sqlite3'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type {
-  IndexStatus,
-  KeywordHit,
-  MessageRecord,
-  MessageResult,
-  Role,
-} from '../types.js'
+import type { IndexStatus, KeywordHit, Unit, UnitKind, UnitResult } from '../types.js'
 import { segmentForFts } from '../search/segment.js'
 
 type BetterSqlite3 = ReturnType<typeof DatabaseConstructor>
-type SqliteStatement = import('better-sqlite3').Statement<unknown[], unknown>
+type Statement = import('better-sqlite3').Statement<unknown[], unknown>
 
-/** 定位 schema.sql */
+/** 定位 schema.sql。 */
 function schemaPath(): string {
   const here = dirname(fileURLToPath(import.meta.url))
   for (const p of [join(here, 'schema.sql'), join(here, '..', '..', 'src', 'store', 'schema.sql')]) {
@@ -31,70 +24,92 @@ function schemaPath(): string {
   throw new Error(`schema.sql not found near ${here}`)
 }
 
-/** 打开选项 */
+/** 打开选项。 */
 export interface OpenOptions {
   path?: string
 }
 
-/** message 表联查后的行 */
-interface MessageRow {
+/** message 表的行。 */
+interface Row {
   row_id: number
   sessionId: string
   idx: number
-  role: string
-  text: string
+  kind: string
+  summary: string
+  content: string
   at: string
   in_context: number
   tags: string
 }
 
 /**
- * 消息存储。
+ * 单位存储。
  *
- * 写入按会话线性分配 idx：会话内第一个消息 idx=0，之后 +1。
- * 已存在（同 sessionId + 同文本 + 同位置）则复用编号。
+ * 两条关键规则：
+ * 1. 编号线性且永不改变（含 summary 挂接、老化标记）。
+ * 2. thinking 的 content **不进 FTS**（只进向量），但它的 summary 进 FTS。
  */
 export class MemoryStore {
   private readonly db: BetterSqlite3
   private readonly dbPath: string
 
-  private readonly stmtInsert: SqliteStatement
-  private readonly stmtFindByText: SqliteStatement
-  private readonly stmtNextIdx: SqliteStatement
-  private readonly stmtInsertFts: SqliteStatement
-  private readonly stmtDeleteFts: SqliteStatement
+  private readonly stmtInsert: Statement
+  private readonly stmtFind: Statement
+  private readonly stmtNext: Statement
+  private readonly stmtFtsInsert: Statement
+  private readonly stmtFtsDelete: Statement
 
   constructor(options: OpenOptions = {}) {
     this.dbPath = options.path ?? ':memory:'
     if (this.dbPath !== ':memory:') mkdirSync(dirname(this.dbPath), { recursive: true })
     this.db = DatabaseConstructor(this.dbPath)
     this.db.pragma('journal_mode = WAL')
-    this.migrate()
+    this.db.exec(readFileSync(schemaPath(), 'utf8'))
+    this.assertSchema()
 
     this.stmtInsert = this.db.prepare(
-      `INSERT INTO message (sessionId, idx, role, text, at, in_context, tags)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO message (sessionId, idx, kind, summary, content, at, in_context, tags)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-    // 幂等查找：同一会话内，同角色同正文的消息视为同一条
-    this.stmtFindByText = this.db.prepare(
-      `SELECT row_id, idx FROM message WHERE sessionId = ? AND role = ? AND text = ? LIMIT 1`,
+    this.stmtFind = this.db.prepare(
+      `SELECT * FROM message WHERE sessionId = ? AND idx = ?`,
     )
-    this.stmtNextIdx = this.db.prepare(
+    this.stmtNext = this.db.prepare(
       `SELECT IFNULL(MAX(idx), -1) + 1 AS next FROM message WHERE sessionId = ?`,
     )
-    this.stmtInsertFts = this.db.prepare(`INSERT INTO message_fts (rowid, text) VALUES (?, ?)`)
-    this.stmtDeleteFts = this.db.prepare(`DELETE FROM message_fts WHERE rowid = ?`)
+    this.stmtFtsInsert = this.db.prepare(`INSERT INTO message_fts (rowid, text) VALUES (?, ?)`)
+    this.stmtFtsDelete = this.db.prepare(`DELETE FROM message_fts WHERE rowid = ?`)
   }
 
-  private migrate(): void {
-    this.db.exec(readFileSync(schemaPath(), 'utf8'))
+  /**
+   * 校验库结构与当前 schema 一致。
+   *
+   * `CREATE TABLE IF NOT EXISTS` 不会迁移旧表——旧版本的库（例如 message 表
+   * 用 role 列而非 kind 列）不会被自动修正，继续使用会得到难以理解的
+   * "no column named kind" 报错。这里提前失败并说明怎么处理。
+   */
+  private assertSchema(): void {
+    const cols = this.db
+      .prepare(`SELECT name FROM pragma_table_info('message')`)
+      .all() as Array<{ name: string }>
+    const names = new Set(cols.map(c => c.name))
+    if (names.size === 0) return // 表刚建好，异常路径
+    const required = ['sessionId', 'idx', 'kind', 'summary', 'content', 'at', 'in_context', 'tags']
+    const missing = required.filter(r => !names.has(r))
+    if (missing.length > 0) {
+      throw new Error(
+        `memory.sqlite 结构过旧（message 表缺少列：${missing.join(', ')}）。`
+        + `这是旧版本留下的数据库，不支持自动迁移。`
+        + `请删除该数据库重建：删除 ${this.dbPath} 后重启插件。`,
+      )
+    }
   }
 
   close(): void {
     this.db.close()
   }
 
-  /** 底层连接（供 segment/pending/vector 复用同一连接） */
+  /** 底层连接（供向量表复用）。 */
   get raw(): ReturnType<typeof DatabaseConstructor> {
     return this.db
   }
@@ -104,64 +119,77 @@ export class MemoryStore {
   // -------------------------------------------------------------------------
 
   /**
-   * 追加一条消息，返回它的会话内索引。
+   * 追加一个单位，返回它的编号。
    *
-   * 幂等：同一会话内、同角色、同正文的消息已存在时复用原编号。
-   * 否则分配 `MAX(idx)+1`（会话第一条为 0）。
-   *
-   * @param msg - 消息内容。
-   * @returns 该消息的会话内索引。
+   * 幂等：同会话内 kind + content 完全相同视为同一单位，复用编号
+   * （只更新 summary/in_context/tags）。这是同步同一批消息不产生重复编号的关键。
    */
-  appendMessage(msg: Omit<MessageRecord, 'idx'>): number {
-    const existing = this.stmtFindByText.get(msg.sessionId, msg.role, msg.text) as
-      | { row_id: number; idx: number }
-      | undefined
+  appendUnit(unit: Omit<Unit, 'idx'>): number {
+    const existing = this.db
+      .prepare(`SELECT idx, row_id FROM message WHERE sessionId = ? AND kind = ? AND content = ? LIMIT 1`)
+      .get(unit.sessionId, unit.kind, unit.content) as { idx: number; row_id: number } | undefined
+
     if (existing) {
-      // 已存在：更新上下文状态与便签，编号不变
       this.db
         .prepare(`UPDATE message SET in_context = ?, tags = ?, at = ? WHERE row_id = ?`)
-        .run(msg.inContext === false ? 0 : 1, JSON.stringify(msg.tags ?? []), msg.at, existing.row_id)
+        .run(unit.inContext === false ? 0 : 1, JSON.stringify(unit.tags ?? []), unit.at, existing.row_id)
       return existing.idx
     }
 
-    const next = this.stmtNextIdx.get(msg.sessionId) as { next: number }
+    const next = this.stmtNext.get(unit.sessionId) as { next: number }
     const idx = next.next
     this.stmtInsert.run(
-      msg.sessionId,
+      unit.sessionId,
       idx,
-      msg.role,
-      msg.text,
-      msg.at,
-      msg.inContext === false ? 0 : 1,
-      JSON.stringify(msg.tags ?? []),
+      unit.kind,
+      unit.summary,
+      unit.content,
+      unit.at,
+      unit.inContext === false ? 0 : 1,
+      JSON.stringify(unit.tags ?? []),
     )
-    const row = this.stmtFindByText.get(msg.sessionId, msg.role, msg.text) as { row_id: number; idx: number }
-    this.stmtDeleteFts.run(row.row_id)
-    this.stmtInsertFts.run(row.row_id, segmentForFts(msg.text))
+    const row = this.stmtFind.get(unit.sessionId, idx) as Row
+    this.reindexFts(row)
     return idx
   }
 
-  /** 批量追加（单事务）。返回每条消息的索引。 */
-  appendBatch(msgs: Array<Omit<MessageRecord, 'idx'>>): number[] {
-    const tx = this.db.transaction((rows: Array<Omit<MessageRecord, 'idx'>>) =>
-      rows.map(m => this.appendMessage(m)),
-    )
-    return tx(msgs)
+  /**
+   * 挂接 summary（总结完成后调用）。
+   *
+   * 编号不变；summary 参与 FTS。
+   */
+  setSummary(sessionId: string, idx: number, summary: string): boolean {
+    const row = this.stmtFind.get(sessionId, idx) as Row | undefined
+    if (!row) return false
+    this.db.prepare(`UPDATE message SET summary = ? WHERE row_id = ?`).run(summary, row.row_id)
+    const updated = { ...row, summary }
+    this.reindexFts(updated)
+    return true
   }
 
-  /** 把某会话的某些 idx 标记为「已不在上下文」。 */
-  markOutOfContext(sessionId: string, fromIdx: number, toIdx: number): number {
-    const info = this.db
-      .prepare(`UPDATE message SET in_context = 0 WHERE sessionId = ? AND idx >= ? AND idx <= ?`)
-      .run(sessionId, fromIdx, toIdx)
-    return info.changes
+  /**
+   * 重建一条单位的 FTS 记录。
+   *
+   * 收录规则：summary + content；但 thinking 的 content 只进向量不进 FTS
+   * （既定决策：思考内容别索引，避免搜索命中过多）。
+   */
+  private reindexFts(row: Row): void {
+    const parts: string[] = []
+    if (row.summary.trim().length > 0) parts.push(row.summary)
+    if (row.kind !== 'thinking') parts.push(row.content)
+    const text = parts.join('\n').trim()
+    this.stmtFtsDelete.run(row.row_id)
+    if (text.length > 0) this.stmtFtsInsert.run(row.row_id, segmentForFts(text))
   }
 
-  /** 追加一条便签（程序内部维护）。 */
+  /** 标记某单位已离开上下文（编号保留）。 */
+  markOutOfContext(sessionId: string, idx: number): void {
+    this.db.prepare(`UPDATE message SET in_context = 0 WHERE sessionId = ? AND idx = ?`).run(sessionId, idx)
+  }
+
+  /** 追加便签（程序内部维护）。 */
   addTag(sessionId: string, idx: number, tag: string): void {
-    const row = this.db
-      .prepare(`SELECT row_id, tags FROM message WHERE sessionId = ? AND idx = ?`)
-      .get(sessionId, idx) as { row_id: number; tags: string } | undefined
+    const row = this.stmtFind.get(sessionId, idx) as Row | undefined
     if (!row) return
     const tags = parseTags(row.tags)
     if (tags.includes(tag)) return
@@ -173,21 +201,19 @@ export class MemoryStore {
   // 读取
   // -------------------------------------------------------------------------
 
-  /** 按 (sessionId, idx) 取**全量**消息——这是模型要查的东西。 */
-  getMessage(sessionId: string, idx: number): MessageResult | undefined {
-    const row = this.db
-      .prepare(`SELECT * FROM message WHERE sessionId = ? AND idx = ?`)
-      .get(sessionId, idx) as MessageRow | undefined
+  /** 取一个单位（全量 content）。 */
+  getUnit(sessionId: string, idx: number): UnitResult | undefined {
+    const row = this.stmtFind.get(sessionId, idx) as Row | undefined
     return row ? toResult(row) : undefined
   }
 
-  /** 按内部 row_id 取（FTS 回链用）。 */
-  getByRowId(rowId: number): MessageResult | undefined {
-    const row = this.db.prepare(`SELECT * FROM message WHERE row_id = ?`).get(rowId) as MessageRow | undefined
+  /** 按内部 row_id 取。 */
+  getByRowId(rowId: number): UnitResult | undefined {
+    const row = this.db.prepare(`SELECT * FROM message WHERE row_id = ?`).get(rowId) as Row | undefined
     return row ? toResult(row) : undefined
   }
 
-  /** 某会话的编号范围（最小/最大 idx），用于告诉模型可查范围。 */
+  /** 某会话的编号范围。 */
   indexRange(sessionId: string): { min: number; max: number } | undefined {
     const row = this.db
       .prepare(`SELECT MIN(idx) AS lo, MAX(idx) AS hi FROM message WHERE sessionId = ?`)
@@ -196,64 +222,45 @@ export class MemoryStore {
     return { min: row.lo, max: row.hi }
   }
 
-  /** 某会话的消息总数。 */
+  /** 单位总数。 */
   count(sessionId: string): number {
-    return (this.db
-      .prepare(`SELECT COUNT(*) AS n FROM message WHERE sessionId = ?`)
-      .get(sessionId) as { n: number }).n
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM message WHERE sessionId = ?`).get(sessionId) as { n: number }).n
   }
 
-  /** 按编号区间列出消息（升序）。 */
-  listRange(sessionId: string, fromIdx: number, toIdx: number): MessageResult[] {
+  /** 按编号区间列出（升序）。 */
+  listRange(sessionId: string, fromIdx: number, toIdx: number): UnitResult[] {
     const rows = this.db
       .prepare(`SELECT * FROM message WHERE sessionId = ? AND idx >= ? AND idx <= ? ORDER BY idx ASC`)
-      .all(sessionId, fromIdx, toIdx) as MessageRow[]
+      .all(sessionId, fromIdx, toIdx) as Row[]
     return rows.map(toResult)
   }
 
-  /** FTS 关键词查询。 */
+  /** FTS 检索。 */
   searchFts(query: string, limit: number, sessionId?: string): KeywordHit[] {
     const rows = sessionId
       ? this.db.prepare(
-          `SELECT m.row_id, m.sessionId, m.idx, m.role, m.at, rank
+          `SELECT m.row_id, m.sessionId, m.idx, m.kind, m.at, rank
            FROM message_fts JOIN message m ON m.row_id = message_fts.rowid
-           WHERE message_fts MATCH ? AND m.sessionId = ?
-           ORDER BY rank LIMIT ?`,
+           WHERE message_fts MATCH ? AND m.sessionId = ? ORDER BY rank LIMIT ?`,
         ).all(query, sessionId, limit)
       : this.db.prepare(
-          `SELECT m.row_id, m.sessionId, m.idx, m.role, m.at, rank
+          `SELECT m.row_id, m.sessionId, m.idx, m.kind, m.at, rank
            FROM message_fts JOIN message m ON m.row_id = message_fts.rowid
-           WHERE message_fts MATCH ?
-           ORDER BY rank LIMIT ?`,
+           WHERE message_fts MATCH ? ORDER BY rank LIMIT ?`,
         ).all(query, limit)
-    return (rows as Array<{
-      row_id: number
-      sessionId: string
-      idx: number
-      role: string
-      at: string
-      rank: number
-    }>).map(r => ({
-      rowId: r.row_id,
-      sessionId: r.sessionId,
-      idx: r.idx,
-      role: r.role as Role,
-      at: r.at,
-      rank: r.rank,
-    }))
-  }
-
-  /** FTS snippet。 */
-  snippet(rowId: number, query: string): string | undefined {
-    const row = this.db
-      .prepare(`SELECT snippet(message_fts, 0, '[', ']', '…', 24) AS s FROM message_fts WHERE message_fts MATCH ? AND rowid = ?`)
-      .get(query, rowId) as { s: string } | undefined
-    if (!row) return undefined
-    return row.s.replace(/([\u4e00-\u9fff\u3400-\u4dbf]) (?=[\u4e00-\u9fff\u3400-\u4dbf])/g, '$1')
+    return (rows as Array<{ row_id: number; sessionId: string; idx: number; kind: string; at: string; rank: number }>)
+      .map(r => ({
+        rowId: r.row_id,
+        sessionId: r.sessionId,
+        idx: r.idx,
+        kind: r.kind as UnitKind,
+        at: r.at,
+        rank: r.rank,
+      }))
   }
 
   // -------------------------------------------------------------------------
-  // 元信息 / 统计
+  // 元信息
   // -------------------------------------------------------------------------
 
   setMeta(key: string, value: string): void {
@@ -271,16 +278,15 @@ export class MemoryStore {
     const n = (sql: string): number => (this.db.prepare(sql).get() as { n: number }).n
     return {
       sessions: n(`SELECT COUNT(DISTINCT sessionId) AS n FROM message`),
-      messages: n(`SELECT COUNT(*) AS n FROM message`),
+      units: n(`SELECT COUNT(*) AS n FROM message`),
       inContext: n(`SELECT COUNT(*) AS n FROM message WHERE in_context = 1`),
-      segments: n(`SELECT COUNT(*) AS n FROM segment`),
-      liveSegments: n(`SELECT COUNT(*) AS n FROM segment WHERE stage = 'live'`),
+      withSummary: n(`SELECT COUNT(*) AS n FROM message WHERE summary <> ''`),
       lastIndexedAt: this.getMeta('lastIndexedAt') ?? null,
     }
   }
 }
 
-/** 安全解析标签数组。 */
+/** 解析便签。 */
 export function parseTags(raw: string): string[] {
   try {
     const v = JSON.parse(raw)
@@ -290,13 +296,14 @@ export function parseTags(raw: string): string[] {
   }
 }
 
-function toResult(row: MessageRow): MessageResult {
+function toResult(row: Row): UnitResult {
   return {
     rowId: row.row_id,
     sessionId: row.sessionId,
     idx: row.idx,
-    role: row.role as Role,
-    text: row.text,
+    kind: row.kind as UnitKind,
+    summary: row.summary,
+    content: row.content,
     at: row.at,
     inContext: row.in_context === 1,
     tags: parseTags(row.tags),
