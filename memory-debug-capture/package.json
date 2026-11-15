@@ -42,5 +42,6 @@
     "@deepseek-ai/cordis": "^4.1.0",
     "@types/node": "^22.15.0",
     "typescript": "^5.8.0"
-  }
+  },
+  "license": "GPL-3.0-or-later"
 }
